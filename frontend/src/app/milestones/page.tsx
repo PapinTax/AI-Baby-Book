@@ -125,6 +125,11 @@ export default function MilestonesPage() {
             onApprove={handleApprove}
             onReject={handleReject}
             onRemove={handleRemove}
+            onLabelChange={(id, label) =>
+              setMilestones((prev) =>
+                prev.map((x) => (x.id === id ? { ...x, label } : x))
+              )
+            }
           />
         ))}
       </div>

@@ -104,8 +104,46 @@ export function rescanLowConfidence(maxConfidence = 0.75, limit = 50) {
   });
 }
 
-export function getTimeline(approvedOnly = true) {
-  return request<TimelineItem[]>(`/timeline?approved_only=${approvedOnly}`);
+export interface UploadResult {
+  photo_id: number;
+  filename: string;
+  taken_at: string | null;
+  thumbnail_url: string | null;
+  milestone_id: number | null;
+  detection: {
+    has_milestone: boolean;
+    milestone_type: string | null;
+    label: string;
+    description: string | null;
+    confidence: number;
+    approximate_age: string | null;
+    evidence: string[];
+  } | null;
+}
+
+export function uploadPhoto(file: File, minConfidence = 0.5): Promise<UploadResult> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("min_confidence", String(minConfidence));
+  return fetch(`${BASE}/photos/upload`, { method: "POST", body: form }).then(
+    async (res) => {
+      if (!res.ok) throw new Error(`Upload failed: ${await res.text()}`);
+      return res.json();
+    }
+  );
+}
+
+export function updateMilestoneLabel(id: number, label: string) {
+  return request<Milestone>(`/milestones/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ approved: true, label }),
+  });
+}
+
+export function getTimeline(approvedOnly = true, childId?: number) {
+  const params = new URLSearchParams({ approved_only: String(approvedOnly) });
+  if (childId != null) params.set("child_id", String(childId));
+  return request<TimelineItem[]>(`/timeline?${params}`);
 }
 
 export function getStats() {

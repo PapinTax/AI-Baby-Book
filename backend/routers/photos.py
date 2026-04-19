@@ -1,26 +1,33 @@
 """
 Photo import and scanning endpoints.
-POST /photos/scan  — scan a local directory
-GET  /photos       — list all imported photos
-GET  /photos/{id}  — single photo detail
+POST /photos/scan       — scan a local directory (background job)
+POST /photos/upload     — upload a single photo file (synchronous, returns detection)
+GET  /photos            — list all imported photos
+GET  /photos/{id}       — single photo detail
+GET  /photos/{id}/image — serve the original photo file
 """
 import asyncio
+import mimetypes
 import os
+import tempfile
 import uuid
 import datetime
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, File, Form, HTTPException, BackgroundTasks, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, computed_field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Photo, Milestone
-from services.photo_scanner import scan_directory, sort_by_timestamp, save_thumbnail_to_disk
-from services.milestone_detector import detect_milestones_batch
+from services.photo_scanner import scan_directory, scan_photo, sort_by_timestamp, save_thumbnail_to_disk
+from services.milestone_detector import detect_milestones_batch, detect_milestone
 
 THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
+UPLOADS_DIR = os.getenv("UPLOADS_DIR", "./uploads")
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 
@@ -187,6 +194,96 @@ async def list_photos(db: AsyncSession = Depends(get_db)):
             milestone_count=len(milestones),
         ))
     return result
+
+
+@router.post("/upload")
+async def upload_photo(
+    file: UploadFile = File(...),
+    min_confidence: float = Form(0.5),
+    model: str = Form("claude-haiku-4-5-20251001"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload a single photo, run milestone detection, and return the result.
+    Synchronous — suitable for one-off photo testing.
+    """
+    Path(UPLOADS_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Save the upload to a stable path so the Photo record has a real file_path
+    ext = Path(file.filename or "photo.jpg").suffix or ".jpg"
+    dest_filename = f"{uuid.uuid4().hex}{ext}"
+    dest_path = str(Path(UPLOADS_DIR) / dest_filename)
+
+    content = await file.read()
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+    # Scan & detect
+    scan_result = await asyncio.to_thread(scan_photo, dest_path)
+    if scan_result.error:
+        raise HTTPException(status_code=422, detail=f"Could not read image: {scan_result.error}")
+
+    detection = await asyncio.to_thread(detect_milestone, scan_result, model)
+    thumb_filename = await asyncio.to_thread(save_thumbnail_to_disk, scan_result, THUMBNAILS_DIR)
+
+    # Persist
+    photo = Photo(
+        file_path=dest_path,
+        filename=file.filename or dest_filename,
+        taken_at=scan_result.taken_at,
+        file_size=scan_result.file_size,
+        width=scan_result.width,
+        height=scan_result.height,
+        thumbnail_path=thumb_filename,
+        processed=True,
+    )
+    db.add(photo)
+    await db.flush()
+
+    milestone_saved = None
+    if detection.has_milestone and detection.confidence >= min_confidence:
+        milestone_saved = Milestone(
+            photo_id=photo.id,
+            milestone_type=detection.milestone_type or "memorable_moment",
+            label=detection.label,
+            description=detection.description,
+            confidence=detection.confidence,
+            approximate_age=detection.approximate_age,
+            evidence=detection.evidence,
+        )
+        db.add(milestone_saved)
+
+    await db.commit()
+    await db.refresh(photo)
+
+    return {
+        "photo_id": photo.id,
+        "filename": photo.filename,
+        "taken_at": photo.taken_at,
+        "thumbnail_url": f"/thumbnails/{thumb_filename}" if thumb_filename else None,
+        "detection": {
+            "has_milestone": detection.has_milestone,
+            "milestone_type": detection.milestone_type,
+            "label": detection.label,
+            "description": detection.description,
+            "confidence": detection.confidence,
+            "approximate_age": detection.approximate_age,
+            "evidence": detection.evidence,
+        } if detection.has_milestone else None,
+        "milestone_id": milestone_saved.id if milestone_saved else None,
+    }
+
+
+@router.get("/{photo_id}/image")
+async def serve_photo_image(photo_id: int, db: AsyncSession = Depends(get_db)):
+    """Stream the original photo file for lightbox display."""
+    photo = await db.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if not Path(photo.file_path).is_file():
+        raise HTTPException(status_code=404, detail="Image file not found on disk")
+    media_type = mimetypes.guess_type(photo.file_path)[0] or "image/jpeg"
+    return FileResponse(photo.file_path, media_type=media_type)
 
 
 @router.get("/{photo_id}")

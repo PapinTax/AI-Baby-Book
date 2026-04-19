@@ -10,6 +10,7 @@ from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Milestone, Photo, Child
+from services.age import enrich_age
 
 
 @dataclass
@@ -62,7 +63,11 @@ async def get_timeline(
             label=milestone.label,
             description=milestone.description,
             confidence=milestone.confidence,
-            approximate_age=milestone.approximate_age,
+            approximate_age=enrich_age(
+                milestone.approximate_age,
+                child.birth_date if child else None,
+                photo.taken_at,
+            ),
             taken_at=photo.taken_at,
             child_name=child.name if child else None,
             approved=milestone.approved,
@@ -128,7 +133,11 @@ async def get_pending_review(
             label=m.label,
             description=m.description,
             confidence=m.confidence,
-            approximate_age=m.approximate_age,
+            approximate_age=enrich_age(
+                m.approximate_age,
+                c.birth_date if c else None,
+                p.taken_at,
+            ),
             taken_at=p.taken_at,
             child_name=c.name if c else None,
             approved=m.approved,
