@@ -1,6 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
-import { scanDirectory, getScanStatus, uploadPhoto, UploadResult } from "@/lib/api";
+import { scanDirectory, openScanStream, ScanJobState, uploadPhoto, UploadResult } from "@/lib/api";
 import ConfidenceBadge from "@/components/ConfidenceBadge";
 import clsx from "clsx";
 
@@ -9,23 +9,14 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 // ─── Directory scan tab ────────────────────────────────────────────────────
 
 type ScanPhase = "idle" | "scanning" | "detecting" | "saving" | "complete" | "error";
-
-interface JobStatus {
-  status: ScanPhase;
-  scanned: number;
-  total: number;
-  detected: number;
-  current_file?: string;
-  milestone_count?: number;
-  error?: string;
-}
+type JobStatus = ScanJobState & { status: ScanPhase };
 
 function DirectoryScanTab() {
   const [directory, setDirectory] = useState("");
   const [minConfidence, setMinConfidence] = useState(0.6);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
-  const pollRef = useRef<NodeJS.Timeout | null>(null);
+  const cleanupRef = useRef<(() => void) | null>(null);
 
   const startScan = async () => {
     if (!directory.trim()) return;
@@ -38,18 +29,15 @@ function DirectoryScanTab() {
     }
   };
 
+  // Switch from polling to SSE — cleaner updates, no missed events
   useEffect(() => {
     if (!sessionId) return;
-    pollRef.current = setInterval(async () => {
-      try {
-        const status = await getScanStatus(sessionId);
-        setJob(status as JobStatus);
-        if (status.status === "complete" || status.status === "error") {
-          clearInterval(pollRef.current!);
-        }
-      } catch {}
-    }, 1500);
-    return () => clearInterval(pollRef.current!);
+    cleanupRef.current = openScanStream(
+      sessionId,
+      (state) => setJob(state as JobStatus),
+      () => {},
+    );
+    return () => cleanupRef.current?.();
   }, [sessionId]);
 
   const phaseLabel: Record<ScanPhase, string> = {

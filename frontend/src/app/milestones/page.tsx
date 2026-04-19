@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import {
   getPendingMilestones,
   listMilestones,
@@ -11,6 +11,7 @@ import {
   Child,
 } from "@/lib/api";
 import MilestoneCard from "@/components/MilestoneCard";
+import { useReviewKeyboard } from "@/hooks/useReviewKeyboard";
 
 export default function MilestonesPage() {
   const [milestones, setMilestones] = useState<Milestone[]>([]);
@@ -19,9 +20,12 @@ export default function MilestonesPage() {
   const [tab, setTab] = useState<"pending" | "approved">("pending");
   const [rescanning, setRescanning] = useState(false);
   const [rescanMsg, setRescanMsg] = useState<string | null>(null);
+  const [focusedIdx, setFocusedIdx] = useState(0);
+  const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   const load = async () => {
     setLoading(true);
+    setFocusedIdx(0);
     try {
       const [items, kids] = await Promise.all([
         tab === "pending" ? getPendingMilestones(50) : listMilestones(true),
@@ -36,19 +40,33 @@ export default function MilestonesPage() {
 
   useEffect(() => { load(); }, [tab]);
 
-  const handleApprove = async (id: number, childId?: number) => {
-    await reviewMilestone(id, true, childId);
-    setMilestones((prev) => prev.filter((m) => m.id !== id));
+  // Scroll focused card into view
+  useEffect(() => {
+    cardRefs.current[focusedIdx]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [focusedIdx]);
+
+  const removeFromList = (id: number) => {
+    setMilestones((prev) => {
+      const next = prev.filter((m) => m.id !== id);
+      // Keep focus within bounds after removal
+      setFocusedIdx((i) => Math.min(i, Math.max(0, next.length - 1)));
+      return next;
+    });
   };
 
-  const handleReject = async (id: number) => {
+  const handleApprove = useCallback(async (id: number, childId?: number) => {
+    await reviewMilestone(id, true, childId);
+    removeFromList(id);
+  }, []);
+
+  const handleReject = useCallback(async (id: number) => {
     await reviewMilestone(id, false);
-    setMilestones((prev) => prev.filter((m) => m.id !== id));
-  };
+    removeFromList(id);
+  }, []);
 
   const handleRemove = async (id: number) => {
     await deleteMilestone(id);
-    setMilestones((prev) => prev.filter((m) => m.id !== id));
+    removeFromList(id);
   };
 
   const handleRescan = async () => {
@@ -57,7 +75,6 @@ export default function MilestonesPage() {
     try {
       const res = await rescanLowConfidence(0.75, 50);
       setRescanMsg(res.message);
-      // Reload after a short delay to pick up improved results
       setTimeout(load, 3000);
     } catch (e: any) {
       setRescanMsg(`Error: ${e.message}`);
@@ -66,11 +83,32 @@ export default function MilestonesPage() {
     }
   };
 
+  // Keyboard shortcuts — only active on pending tab
+  useReviewKeyboard({
+    total: milestones.length,
+    focusedIdx,
+    setFocusedIdx,
+    onApprove: useCallback(() => {
+      if (milestones[focusedIdx]) handleApprove(milestones[focusedIdx].id);
+    }, [milestones, focusedIdx, handleApprove]),
+    onReject: useCallback(() => {
+      if (milestones[focusedIdx]) handleReject(milestones[focusedIdx].id);
+    }, [milestones, focusedIdx, handleReject]),
+    enabled: tab === "pending" && !loading,
+  });
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="text-2xl font-bold text-gray-800">Milestone Review</h1>
+        <div>
+          <h1 className="text-2xl font-bold text-gray-800">Milestone Review</h1>
+          {tab === "pending" && milestones.length > 0 && (
+            <p className="text-xs text-gray-400 mt-0.5">
+              j/k to navigate · a to approve · r to reject
+            </p>
+          )}
+        </div>
         <div className="flex gap-2 flex-wrap">
           {tab === "pending" && (
             <button
@@ -103,9 +141,7 @@ export default function MilestonesPage() {
         </div>
       )}
 
-      {loading && (
-        <div className="text-center py-16 text-gray-400">Loading...</div>
-      )}
+      {loading && <div className="text-center py-16 text-gray-400">Loading...</div>}
 
       {!loading && milestones.length === 0 && (
         <div className="text-center py-16 text-gray-400">
@@ -116,19 +152,19 @@ export default function MilestonesPage() {
       )}
 
       <div className="grid gap-4">
-        {milestones.map((m) => (
+        {milestones.map((m, idx) => (
           <MilestoneCard
             key={m.id}
+            ref={(el) => { cardRefs.current[idx] = el; }}
             milestone={m}
             children={children}
             mode={tab === "pending" ? "review" : "approved"}
+            focused={tab === "pending" && idx === focusedIdx}
             onApprove={handleApprove}
             onReject={handleReject}
             onRemove={handleRemove}
             onLabelChange={(id, label) =>
-              setMilestones((prev) =>
-                prev.map((x) => (x.id === id ? { ...x, label } : x))
-              )
+              setMilestones((prev) => prev.map((x) => (x.id === id ? { ...x, label } : x)))
             }
           />
         ))}

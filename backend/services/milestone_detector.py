@@ -54,7 +54,8 @@ Return ONLY valid JSON in this exact format:
   "description": "<1-2 warm, parent-friendly sentences describing the moment>",
   "confidence": <0.0 to 1.0>,
   "approximate_age": "<e.g. '~6 months', '~1 year', 'newborn', or null if unknown>",
-  "evidence": ["<visual cue 1>", "<visual cue 2>"]
+  "evidence": ["<visual cue 1>", "<visual cue 2>"],
+  "child_features": "<brief visible child description to help parents identify which child, e.g. 'light hair, appears around 10 months' — or null if unclear>"
 }
 
 Milestone taxonomy:
@@ -66,6 +67,7 @@ Rules:
 - Keep description warm and parent-friendly, like a caption in a baby book
 - If multiple milestones apply, pick the most significant one
 - Never guess — if unclear, lower the confidence score
+- child_features: describe only what is clearly visible (hair color, approx age appearance). Omit race/ethnicity.
 """
 
 
@@ -77,7 +79,8 @@ class MilestoneDetection:
     description: Optional[str]
     confidence: float
     approximate_age: Optional[str]
-    evidence: list[str]
+    evidence: list[str]         # visual cues + optional child_features prepended
+    child_features: Optional[str]
     photo_path: str
     raw_response: Optional[str] = None
     error: Optional[str] = None
@@ -114,6 +117,11 @@ def _parse_response(raw: str, photo_path: str) -> MilestoneDetection:
             if text.startswith("json"):
                 text = text[4:]
         data = json.loads(text.strip())
+        child_features = data.get("child_features") or None
+        evidence = data.get("evidence", [])
+        # Prepend child_features so it appears as the first evidence chip
+        if child_features:
+            evidence = [f"Child: {child_features}"] + evidence
         return MilestoneDetection(
             has_milestone=bool(data.get("has_milestone", False)),
             milestone_type=data.get("milestone_type"),
@@ -121,7 +129,8 @@ def _parse_response(raw: str, photo_path: str) -> MilestoneDetection:
             description=data.get("description"),
             confidence=float(data.get("confidence", 0.0)),
             approximate_age=data.get("approximate_age"),
-            evidence=data.get("evidence", []),
+            evidence=evidence,
+            child_features=child_features,
             photo_path=photo_path,
             raw_response=raw,
         )
@@ -134,6 +143,7 @@ def _parse_response(raw: str, photo_path: str) -> MilestoneDetection:
             confidence=0.0,
             approximate_age=None,
             evidence=[],
+            child_features=None,
             photo_path=photo_path,
             raw_response=raw,
             error=str(e),
@@ -154,6 +164,7 @@ def detect_milestone(photo: PhotoScanResult, model: str = DEFAULT_MODEL) -> Mile
             confidence=0.0,
             approximate_age=None,
             evidence=[],
+            child_features=None,
             photo_path=photo.file_path,
             error="Photo could not be loaded",
         )
@@ -176,6 +187,7 @@ def detect_milestone(photo: PhotoScanResult, model: str = DEFAULT_MODEL) -> Mile
             confidence=0.0,
             approximate_age=None,
             evidence=[],
+            child_features=None,
             photo_path=photo.file_path,
             error=str(e),
         )

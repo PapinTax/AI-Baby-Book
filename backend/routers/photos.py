@@ -167,10 +167,50 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
 
 @router.get("/scan/{session_id}")
 async def scan_status(session_id: str):
-    """Poll scan job status."""
+    """Poll scan job status (single snapshot)."""
     if session_id not in _scan_jobs:
         raise HTTPException(status_code=404, detail="Session not found")
     return _scan_jobs[session_id]
+
+
+@router.get("/scan/{session_id}/stream")
+async def scan_stream(session_id: str):
+    """
+    Server-Sent Events stream for real-time scan progress.
+    Client connects once and receives state updates at ~500 ms intervals
+    until status is 'complete' or 'error'.
+    """
+    import asyncio
+    import json
+    from fastapi.responses import StreamingResponse
+
+    async def generator():
+        # Wait briefly for the job to be registered by the background task
+        for _ in range(20):
+            if session_id in _scan_jobs:
+                break
+            await asyncio.sleep(0.1)
+
+        if session_id not in _scan_jobs:
+            yield f"data: {json.dumps({'error': 'session not found'})}\n\n"
+            return
+
+        while True:
+            state = _scan_jobs.get(session_id, {})
+            yield f"data: {json.dumps(state)}\n\n"
+            if state.get("status") in ("complete", "error"):
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # prevent nginx buffering
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @router.get("", response_model=list[PhotoResponse])

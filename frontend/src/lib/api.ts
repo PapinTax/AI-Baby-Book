@@ -22,6 +22,7 @@ export interface Photo {
   height: number | null;
   processed: boolean;
   milestone_count: number;
+  thumbnail_url: string | null;
 }
 
 export function scanDirectory(directory: string, minConfidence = 0.5) {
@@ -41,6 +42,46 @@ export function getScanStatus(sessionId: string) {
     milestone_count?: number;
     error?: string;
   }>(`/photos/scan/${sessionId}`);
+}
+
+export type ScanJobState = {
+  status: string;
+  scanned: number;
+  total: number;
+  detected: number;
+  current_file?: string;
+  milestone_count?: number;
+  error?: string;
+};
+
+/**
+ * Open an SSE stream for real-time scan progress.
+ * Returns a cleanup function — call it to close the connection.
+ */
+export function openScanStream(
+  sessionId: string,
+  onUpdate: (state: ScanJobState) => void,
+  onDone: () => void,
+): () => void {
+  const es = new EventSource(`${BASE}/photos/scan/${sessionId}/stream`);
+
+  es.onmessage = (e) => {
+    try {
+      const data: ScanJobState = JSON.parse(e.data);
+      onUpdate(data);
+      if (data.status === "complete" || data.status === "error") {
+        es.close();
+        onDone();
+      }
+    } catch {}
+  };
+
+  es.onerror = () => {
+    es.close();
+    onDone();
+  };
+
+  return () => es.close();
 }
 
 export function listPhotos() {

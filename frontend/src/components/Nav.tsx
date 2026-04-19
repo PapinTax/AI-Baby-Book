@@ -8,7 +8,10 @@ export default function Nav() {
           Baby Book
         </Link>
         <Link href="/upload" className="text-sm text-gray-600 hover:text-brand-600">
-          Import Photos
+          Import
+        </Link>
+        <Link href="/photos" className="text-sm text-gray-600 hover:text-brand-600">
+          Photos
         </Link>
         <Link href="/milestones" className="text-sm text-gray-600 hover:text-brand-600">
           Review

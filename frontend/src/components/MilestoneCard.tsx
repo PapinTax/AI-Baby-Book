@@ -1,5 +1,5 @@
 "use client";
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, forwardRef } from "react";
 import { Milestone, Child, updateMilestoneLabel } from "@/lib/api";
 import ConfidenceBadge from "./ConfidenceBadge";
 import Lightbox from "./Lightbox";
@@ -25,21 +25,23 @@ interface Props {
   milestone: Milestone;
   children?: Child[];
   mode: "review" | "approved";
+  focused?: boolean;
   onApprove?: (id: number, childId?: number) => void;
   onReject?: (id: number) => void;
   onRemove?: (id: number) => void;
   onLabelChange?: (id: number, label: string) => void;
 }
 
-export default function MilestoneCard({
+const MilestoneCard = forwardRef<HTMLDivElement, Props>(function MilestoneCard({
   milestone: m,
   children = [],
   mode,
+  focused = false,
   onApprove,
   onReject,
   onRemove,
   onLabelChange,
-}: Props) {
+}, ref) {
   const thumbSrc = m.thumbnail_url ? `${API}${m.thumbnail_url}` : null;
   const [editing, setEditing] = useState(false);
   const [labelDraft, setLabelDraft] = useState(m.label);
@@ -72,7 +74,12 @@ export default function MilestoneCard({
         <Lightbox photoId={m.photo_id} label={m.label} onClose={() => setLightboxOpen(false)} />
       )}
 
-      <div className="bg-white rounded-2xl shadow-sm border border-brand-100 overflow-hidden">
+      <div
+        ref={ref}
+        className={`bg-white rounded-2xl shadow-sm border overflow-hidden transition-shadow ${
+          focused ? "border-brand-400 shadow-md ring-2 ring-brand-200" : "border-brand-100"
+        }`}
+      >
         <div className="flex">
           {/* Thumbnail — click to open lightbox */}
           <button
@@ -205,4 +212,6 @@ export default function MilestoneCard({
       </div>
     </>
   );
-}
+});
+
+export default MilestoneCard;
