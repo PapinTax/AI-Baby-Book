@@ -26,6 +26,7 @@ class TimelineEntry:
     taken_at: Optional[datetime.datetime]
     child_name: Optional[str]
     approved: Optional[bool]
+    evidence: Optional[list] = None
 
 
 async def get_timeline(
@@ -65,6 +66,7 @@ async def get_timeline(
             taken_at=photo.taken_at,
             child_name=child.name if child else None,
             approved=milestone.approved,
+            evidence=milestone.evidence,
         ))
     return entries
 
@@ -130,6 +132,7 @@ async def get_pending_review(
             taken_at=p.taken_at,
             child_name=c.name if c else None,
             approved=m.approved,
+            evidence=m.evidence,
         )
         for m, p, c in rows
     ]

@@ -6,12 +6,12 @@ import asyncio
 import base64
 import datetime
 import hashlib
+import io
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import piexif
 from PIL import Image, ExifTags
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
@@ -59,16 +59,40 @@ def _extract_taken_at(img: Image.Image) -> Optional[datetime.datetime]:
     return None
 
 
-def _image_to_b64(img: Image.Image, max_size: tuple[int, int]) -> str:
-    """Resize image, convert to JPEG base64."""
-    import io
+def _image_to_bytes(img: Image.Image, max_size: tuple[int, int], quality: int = 85) -> bytes:
+    """Resize image and return JPEG bytes."""
     img = img.copy()
     img.thumbnail(max_size, Image.LANCZOS)
     if img.mode in ("RGBA", "P", "LA"):
         img = img.convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode()
+    img.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
+
+
+def _image_to_b64(img: Image.Image, max_size: tuple[int, int]) -> str:
+    """Resize image, convert to JPEG base64."""
+    return base64.b64encode(_image_to_bytes(img, max_size)).decode()
+
+
+def _thumbnail_filename(file_path: str) -> str:
+    """Deterministic filename for a photo's thumbnail: sha256[:16].jpg"""
+    return hashlib.sha256(file_path.encode()).hexdigest()[:16] + ".jpg"
+
+
+def save_thumbnail_to_disk(result: "PhotoScanResult", thumbnails_dir: str) -> Optional[str]:
+    """
+    Write the thumbnail bytes for a scan result to disk.
+    Returns the filename (not full path) or None on failure.
+    Idempotent — skips write if file already exists.
+    """
+    if not result.thumbnail_b64:
+        return None
+    filename = _thumbnail_filename(result.file_path)
+    dest = Path(thumbnails_dir) / filename
+    if not dest.exists():
+        dest.write_bytes(base64.b64decode(result.thumbnail_b64))
+    return filename
 
 
 def scan_photo(file_path: str) -> PhotoScanResult:
@@ -78,7 +102,7 @@ def scan_photo(file_path: str) -> PhotoScanResult:
         file_path=file_path,
         filename=path.name,
         taken_at=None,
-        file_size=path.stat().st_size,
+        file_size=0,
         width=None,
         height=None,
         thumbnail_b64=None,
@@ -86,6 +110,7 @@ def scan_photo(file_path: str) -> PhotoScanResult:
     )
 
     try:
+        result.file_size = path.stat().st_size
         with Image.open(file_path) as img:
             result.taken_at = _extract_taken_at(img)
             result.width, result.height = img.size

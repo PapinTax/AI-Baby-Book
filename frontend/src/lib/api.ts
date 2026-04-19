@@ -60,6 +60,7 @@ export interface Milestone {
   approved: boolean | null;
   photo_filename: string | null;
   photo_taken_at: string | null;
+  thumbnail_url: string | null;
   evidence: string[] | null;
 }
 
@@ -93,6 +94,14 @@ export interface TimelineItem {
   approximate_age: string | null;
   taken_at: string | null;
   child_name: string | null;
+  thumbnail_url: string | null;
+}
+
+export function rescanLowConfidence(maxConfidence = 0.75, limit = 50) {
+  return request<{ message: string }>("/milestones/rescan", {
+    method: "POST",
+    body: JSON.stringify({ max_confidence: maxConfidence, limit }),
+  });
 }
 
 export function getTimeline(approvedOnly = true) {

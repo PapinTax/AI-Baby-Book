@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -10,6 +11,10 @@ load_dotenv()
 
 from database import init_db
 from routers import photos, milestones, timeline, children
+
+THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
+# Must exist before StaticFiles mount below
+Path(THUMBNAILS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
@@ -37,6 +42,8 @@ app.include_router(photos.router)
 app.include_router(milestones.router)
 app.include_router(timeline.router)
 app.include_router(children.router)
+
+app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
 
 @app.get("/health")

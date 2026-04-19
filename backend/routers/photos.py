@@ -5,19 +5,22 @@ GET  /photos       — list all imported photos
 GET  /photos/{id}  — single photo detail
 """
 import asyncio
+import os
 import uuid
 import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Photo, Milestone
-from services.photo_scanner import scan_directory, sort_by_timestamp
+from services.photo_scanner import scan_directory, sort_by_timestamp, save_thumbnail_to_disk
 from services.milestone_detector import detect_milestones_batch
+
+THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
 
 router = APIRouter(prefix="/photos", tags=["photos"])
 
@@ -40,11 +43,19 @@ class PhotoResponse(BaseModel):
     id: int
     filename: str
     file_path: str
+    thumbnail_path: Optional[str]
     taken_at: Optional[datetime.datetime]
     width: Optional[int]
     height: Optional[int]
     processed: bool
     milestone_count: int
+
+    @computed_field
+    @property
+    def thumbnail_url(self) -> Optional[str]:
+        if self.thumbnail_path:
+            return f"/thumbnails/{self.thumbnail_path}"
+        return None
 
     class Config:
         from_attributes = True
@@ -85,6 +96,9 @@ async def _run_scan(
         _scan_jobs[session_id]["status"] = "saving"
         async with SessionLocal() as db:
             for scan_result in photos:
+                thumb_filename = await asyncio.to_thread(
+                    save_thumbnail_to_disk, scan_result, THUMBNAILS_DIR
+                )
                 # Upsert photo
                 stmt = select(Photo).where(Photo.file_path == scan_result.file_path)
                 existing = (await db.execute(stmt)).scalar_one_or_none()
@@ -96,12 +110,15 @@ async def _run_scan(
                         file_size=scan_result.file_size,
                         width=scan_result.width,
                         height=scan_result.height,
+                        thumbnail_path=thumb_filename,
                         processed=True,
                         scan_session_id=session_id,
                     )
                     db.add(photo)
                 else:
                     existing.processed = True
+                    if thumb_filename and not existing.thumbnail_path:
+                        existing.thumbnail_path = thumb_filename
 
             await db.flush()
 
@@ -162,6 +179,7 @@ async def list_photos(db: AsyncSession = Depends(get_db)):
             id=photo.id,
             filename=photo.filename,
             file_path=photo.file_path,
+            thumbnail_path=photo.thumbnail_path,
             taken_at=photo.taken_at,
             width=photo.width,
             height=photo.height,

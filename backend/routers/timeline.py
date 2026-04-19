@@ -45,6 +45,7 @@ async def get_timeline_view(
             "approximate_age": e.approximate_age,
             "taken_at": e.taken_at.isoformat() if e.taken_at else None,
             "child_name": e.child_name,
+            "thumbnail_url": f"/thumbnails/{e.thumbnail_path}" if e.thumbnail_path else None,
         }
         for e in entries
     ]

@@ -16,6 +16,9 @@ export default function Nav() {
         <Link href="/timeline" className="text-sm text-gray-600 hover:text-brand-600">
           Timeline
         </Link>
+        <Link href="/children" className="text-sm text-gray-600 hover:text-brand-600">
+          Children
+        </Link>
       </div>
     </nav>
   );

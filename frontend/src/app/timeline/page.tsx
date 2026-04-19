@@ -3,6 +3,8 @@ import { useEffect, useState } from "react";
 import { getTimeline, TimelineItem } from "@/lib/api";
 import ConfidenceBadge from "@/components/ConfidenceBadge";
 
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
 function formatDate(iso: string | null) {
   if (!iso) return "Date unknown";
   return new Date(iso).toLocaleDateString("en-US", {
@@ -123,13 +125,29 @@ export default function TimelinePage() {
                 {/* Dot */}
                 <div className="absolute -left-[2.15rem] top-1 w-4 h-4 rounded-full bg-brand-500 border-2 border-white shadow" />
 
-                <div className="bg-white rounded-2xl p-5 shadow-sm border border-brand-100 hover:shadow-md transition">
-                  <div className="flex items-start gap-3">
-                    <span className="text-3xl select-none">
-                      {MILESTONE_EMOJI[item.milestone_type] ?? "📸"}
-                    </span>
-                    <div className="flex-1 min-w-0">
+                <div className="bg-white rounded-2xl shadow-sm border border-brand-100 hover:shadow-md transition overflow-hidden">
+                  <div className="flex">
+                    {/* Thumbnail */}
+                    <div className="w-24 sm:w-32 shrink-0 bg-gray-50 flex items-center justify-center">
+                      {item.thumbnail_url ? (
+                        <img
+                          src={`${API}${item.thumbnail_url}`}
+                          alt={item.label}
+                          className="w-full h-full object-cover"
+                          style={{ maxHeight: "128px" }}
+                        />
+                      ) : (
+                        <span className="text-4xl select-none p-3">
+                          {MILESTONE_EMOJI[item.milestone_type] ?? "📸"}
+                        </span>
+                      )}
+                    </div>
+                    {/* Content */}
+                    <div className="flex-1 p-4 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap">
+                        {!item.thumbnail_url && (
+                          <span className="text-xl">{MILESTONE_EMOJI[item.milestone_type] ?? "📸"}</span>
+                        )}
                         <h3 className="font-semibold text-gray-800">{item.label}</h3>
                         <ConfidenceBadge confidence={item.confidence} />
                         {item.approximate_age && (
@@ -143,7 +161,7 @@ export default function TimelinePage() {
                         {item.child_name && ` · ${item.child_name}`}
                       </p>
                       {item.description && (
-                        <p className="text-sm text-gray-600 mt-2 leading-relaxed">
+                        <p className="text-sm text-gray-600 mt-2 leading-relaxed line-clamp-3">
                           {item.description}
                         </p>
                       )}
