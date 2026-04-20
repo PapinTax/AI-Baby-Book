@@ -12,7 +12,9 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const DEFAULT_START = "2024-01-30";
 const DEFAULT_END = new Date().toISOString().slice(0, 10);
 
-type ScanPhase = "idle" | "scanning" | "prefiltering" | "detecting" | "saving" | "complete" | "error";
+type ScanPhase =
+  | "idle" | "listing" | "date_checking" | "scanning"
+  | "prefiltering" | "detecting" | "saving" | "complete" | "error";
 type JobStatus = ScanJobState & { status: ScanPhase };
 
 function DirectoryScanTab() {
@@ -34,7 +36,7 @@ function DirectoryScanTab() {
         usePrefilter,
       );
       setSessionId(res.session_id);
-      setJob({ status: "scanning", scanned: 0, total: 0, detected: 0 });
+      setJob({ status: "listing", scanned: 0, total: 0, detected: 0 });
     } catch (e: any) {
       alert(`Failed to start scan: ${e.message}`);
     }
@@ -52,10 +54,11 @@ function DirectoryScanTab() {
 
   const phaseLabel: Record<string, string> = {
     idle: "",
-    date_checking: "Step 1/3 — Checking photo dates (no AI yet)...",
-    scanning: "Step 2/3 — Reading filtered photos...",
-    prefiltering: "Step 2/3 — Pre-filtering: checking for children...",
-    detecting: "Step 3/3 — Detecting milestones with Claude Vision...",
+    listing: "Finding photos...",
+    date_checking: "Step 1/4 — Checking photo dates (no AI yet)...",
+    scanning: "Step 2/4 — Reading filtered photos...",
+    prefiltering: "Step 3/4 — Pre-filtering: checking for children...",
+    detecting: "Step 4/4 — Detecting milestones with Claude Vision...",
     saving: "Saving results...",
     complete: "Scan complete!",
     error: "Scan failed",

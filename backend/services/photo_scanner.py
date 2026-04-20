@@ -234,16 +234,10 @@ def _date_in_range(
     return True
 
 
-async def scan_directory(
-    directory: str,
-    progress_callback=None,
-    start_date: Optional[datetime.date] = None,
-    end_date: Optional[datetime.date] = None,
-) -> list[PhotoScanResult]:
+def list_photo_files(directory: str) -> tuple[list[Path], int]:
     """
-    Walk a directory and scan supported image files.
-    When date range is provided, does a fast EXIF-date-only pass first so the
-    expensive thumbnail/base64 generation only runs on in-range files.
+    Enumerate supported image files under `directory`, excluding iCloud placeholders.
+    Returns (local_files, skipped_cloud_count).
     """
     dir_path = Path(directory)
     if not dir_path.is_dir():
@@ -255,33 +249,74 @@ async def scan_directory(
     ]
     all_files.sort(key=lambda f: f.stat().st_mtime)
 
-    # Skip iCloud placeholder files — they aren't downloaded yet.
-    # Checking file attributes is instant and triggers no downloads.
     local_files = [f for f in all_files if not _is_cloud_placeholder(f)]
     skipped_cloud = len(all_files) - len(local_files)
+    return local_files, skipped_cloud
 
-    # Phase A: date filter using EXIF (safe — files are already local)
-    if start_date or end_date:
-        if progress_callback:
-            progress_callback(0, len(local_files), "Checking dates...", "date_checking")
-        candidates = []
-        for i, f in enumerate(local_files):
-            if progress_callback and i % 100 == 0:
-                progress_callback(i, len(local_files), f.name, "date_checking")
-            d = await asyncio.to_thread(_read_exif_date_only, f)
-            if _date_in_range(d, start_date, end_date):
-                candidates.append(f)
-    else:
-        candidates = local_files
 
-    # Phase B: full scan (thumbnails + base64) on filtered local files only
-    results = []
-    for i, file_path in enumerate(candidates):
+async def filter_files_by_exif_date(
+    files: list[Path],
+    start_date: Optional[datetime.date],
+    end_date: Optional[datetime.date],
+    progress_callback=None,
+) -> list[Path]:
+    """
+    Fast EXIF-date-only pass. Files with unreadable dates are kept (fail-open).
+    progress_callback(current, total, filename) — no phase; caller owns status.
+    """
+    if not (start_date or end_date):
+        return files
+    candidates: list[Path] = []
+    total = len(files)
+    for i, f in enumerate(files):
+        if progress_callback and (i % 50 == 0 or i == total - 1):
+            progress_callback(i + 1, total, f.name)
+        d = await asyncio.to_thread(_read_exif_date_only, f)
+        if _date_in_range(d, start_date, end_date):
+            candidates.append(f)
+    return candidates
+
+
+async def scan_files(
+    files: list[Path],
+    progress_callback=None,
+) -> list[PhotoScanResult]:
+    """
+    Run full scan (thumbnail + base64) on each file.
+    progress_callback(current, total, filename) — no phase; caller owns status.
+    """
+    results: list[PhotoScanResult] = []
+    total = len(files)
+    for i, file_path in enumerate(files):
         if progress_callback:
-            progress_callback(i + 1, len(candidates), file_path.name, "scanning")
+            progress_callback(i + 1, total, file_path.name)
         result = await asyncio.to_thread(scan_photo, str(file_path))
         results.append(result)
+    return results
 
+
+# Legacy combined entry — kept for any callers still using it.
+async def scan_directory(
+    directory: str,
+    progress_callback=None,
+    start_date: Optional[datetime.date] = None,
+    end_date: Optional[datetime.date] = None,
+) -> tuple[list[PhotoScanResult], int]:
+    local_files, skipped_cloud = list_photo_files(directory)
+    candidates = await filter_files_by_exif_date(
+        local_files, start_date, end_date,
+        progress_callback=(
+            (lambda c, t, n: progress_callback(c, t, n, "date_checking"))
+            if progress_callback else None
+        ),
+    )
+    results = await scan_files(
+        candidates,
+        progress_callback=(
+            (lambda c, t, n: progress_callback(c, t, n, "scanning"))
+            if progress_callback else None
+        ),
+    )
     return results, skipped_cloud
 
 

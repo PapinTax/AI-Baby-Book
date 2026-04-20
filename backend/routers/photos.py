@@ -23,7 +23,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Photo, Milestone
-from services.photo_scanner import scan_directory, scan_photo, sort_by_timestamp, save_thumbnail_to_disk
+from services.photo_scanner import (
+    list_photo_files,
+    filter_files_by_exif_date,
+    scan_files,
+    scan_photo,
+    sort_by_timestamp,
+    save_thumbnail_to_disk,
+)
 from services.milestone_detector import detect_milestones_batch, detect_milestone, prefilter_has_child
 
 THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
@@ -80,67 +87,80 @@ async def _run_scan(
     end_date: Optional[datetime.date],
     use_prefilter: bool,
 ):
-    """Background task: scan dir → date filter → prefilter → detect milestones → persist to DB."""
+    """Background task: list → date filter → read → prefilter → detect → persist."""
     from database import SessionLocal
 
-    _scan_jobs[session_id] = {
-        "status": "scanning", "scanned": 0, "total": 0, "detected": 0,
+    job = {
+        "status": "listing", "scanned": 0, "total": 0, "detected": 0,
         "date_filtered": 0, "prefilter_passed": 0, "prefilter_total": 0,
         "cloud_skipped": 0,
     }
+    _scan_jobs[session_id] = job
 
     try:
-        # Phase 1: scan — skips iCloud placeholders, date-filters locally
-        def on_scan_progress(current, total, filename, phase="scanning"):
-            _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename, "status": phase})
+        # ── Phase 1: enumerate files + skip iCloud placeholders ──────────────
+        local_files, cloud_skipped = await asyncio.to_thread(list_photo_files, directory)
+        job["cloud_skipped"] = cloud_skipped
 
-        photos, cloud_skipped = await scan_directory(
-            directory,
-            progress_callback=on_scan_progress,
-            start_date=start_date,
-            end_date=end_date,
-        )
-        _scan_jobs[session_id]["cloud_skipped"] = cloud_skipped
+        # ── Phase 2: fast EXIF date filter (no thumbnail work) ───────────────
+        if start_date or end_date:
+            job["status"] = "date_checking"
+            job["total"] = len(local_files)
+            job["scanned"] = 0
+
+            def on_date_progress(current, total, filename):
+                job["scanned"] = current
+                job["total"] = total
+                job["current_file"] = filename
+
+            candidates = await filter_files_by_exif_date(
+                local_files, start_date, end_date,
+                progress_callback=on_date_progress,
+            )
+            job["date_filtered"] = len(local_files) - len(candidates)
+        else:
+            candidates = local_files
+
+        # ── Phase 3: read filtered photos (thumbnail + base64) ───────────────
+        job["status"] = "scanning"
+        job["total"] = len(candidates)
+        job["scanned"] = 0
+        job["current_file"] = ""
+
+        def on_scan_progress(current, total, filename):
+            job["scanned"] = current
+            job["total"] = total
+            job["current_file"] = filename
+
+        photos = await scan_files(candidates, progress_callback=on_scan_progress)
         photos = sort_by_timestamp(photos)
 
-        # Phase 2: precise EXIF date filter on the already-reduced set
-        if start_date or end_date:
-            before = len(photos)
-            def in_range(r):
-                if not r.taken_at:
-                    return True
-                d = r.taken_at.date()
-                if start_date and d < start_date:
-                    return False
-                if end_date and d > end_date:
-                    return False
-                return True
-            photos = [r for r in photos if in_range(r)]
-            _scan_jobs[session_id]["date_filtered"] = before - len(photos)
-            _scan_jobs[session_id]["total"] = len(photos)
-
-        # Phase 3: prefilter — cheap yes/no "does this contain a child?" check
+        # ── Phase 4: prefilter — cheap "does this contain a child?" check ────
         if use_prefilter and photos:
-            _scan_jobs[session_id]["status"] = "prefiltering"
-            _scan_jobs[session_id]["prefilter_total"] = len(photos)
+            job["status"] = "prefiltering"
+            job["prefilter_total"] = len(photos)
+            job["prefilter_checked"] = 0
+            job["prefilter_passed"] = 0
             passed = []
             for i, photo in enumerate(photos):
-                _scan_jobs[session_id].update({
-                    "prefilter_checked": i + 1,
-                    "current_file": photo.filename,
-                })
+                job["prefilter_checked"] = i + 1
+                job["current_file"] = photo.filename
                 has_child = await asyncio.to_thread(prefilter_has_child, photo, model)
                 if has_child:
                     passed.append(photo)
-            _scan_jobs[session_id]["prefilter_passed"] = len(passed)
-            _scan_jobs[session_id]["total"] = len(passed)
+                    job["prefilter_passed"] = len(passed)
+            job["total"] = len(passed)
             photos = passed
 
-        _scan_jobs[session_id]["status"] = "detecting"
+        # ── Phase 5: detect milestones ───────────────────────────────────────
+        job["status"] = "detecting"
+        job["detected"] = 0
+        job["total"] = len(photos)
 
-        # Phase 4: detect milestones
         def on_detect_progress(current, total, filename):
-            _scan_jobs[session_id].update({"detected": current, "total": total, "current_file": filename})
+            job["detected"] = current
+            job["total"] = total
+            job["current_file"] = filename
 
         detections = await detect_milestones_batch(
             photos,
@@ -149,8 +169,8 @@ async def _run_scan(
             progress_callback=on_detect_progress,
         )
 
-        # Phase 3: persist
-        _scan_jobs[session_id]["status"] = "saving"
+        # ── Phase 6: persist ─────────────────────────────────────────────────
+        job["status"] = "saving"
         async with SessionLocal() as db:
             for scan_result in photos:
                 thumb_filename = await asyncio.to_thread(
@@ -206,12 +226,12 @@ async def _run_scan(
 
             await db.commit()
 
-        _scan_jobs[session_id]["status"] = "complete"
-        _scan_jobs[session_id]["milestone_count"] = len(detections)
+        job["status"] = "complete"
+        job["milestone_count"] = len(detections)
 
     except Exception as e:
-        _scan_jobs[session_id]["status"] = "error"
-        _scan_jobs[session_id]["error"] = str(e)
+        job["status"] = "error"
+        job["error"] = str(e)
 
 
 @router.post("/scan", response_model=ScanResponse)
