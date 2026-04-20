@@ -86,19 +86,22 @@ async def _run_scan(
     _scan_jobs[session_id] = {
         "status": "scanning", "scanned": 0, "total": 0, "detected": 0,
         "date_filtered": 0, "prefilter_passed": 0, "prefilter_total": 0,
+        "cloud_skipped": 0,
     }
 
     try:
-        # Phase 1: scan photos (with built-in EXIF date pre-filter)
+        # Phase 1: scan — skips iCloud placeholders, date-filters locally
         def on_scan_progress(current, total, filename):
             status = "date_checking" if (start_date or end_date) and current < total else "scanning"
             _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename, "status": status})
-        photos = await scan_directory(
+
+        photos, cloud_skipped = await scan_directory(
             directory,
             progress_callback=on_scan_progress,
             start_date=start_date,
             end_date=end_date,
         )
+        _scan_jobs[session_id]["cloud_skipped"] = cloud_skipped
         photos = sort_by_timestamp(photos)
 
         # Phase 2: precise EXIF date filter on the already-reduced set

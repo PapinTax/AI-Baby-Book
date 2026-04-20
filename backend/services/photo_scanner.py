@@ -189,7 +189,27 @@ def scan_photo(file_path: str) -> PhotoScanResult:
     return result
 
 
-def _read_exif_date_only(file_path: Path) -> Optional[datetime.date]:
+def _is_cloud_placeholder(path: Path) -> bool:
+    """
+    Windows-only: returns True if the file is an iCloud placeholder
+    (not yet downloaded). Checks FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.
+    Instant — no file open, no download triggered.
+    """
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        RECALL_ON_DATA_ACCESS = 0x00400000
+        RECALL_ON_OPEN = 0x00040000
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs == 0xFFFFFFFF:
+            return False
+        return bool(attrs & (RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN))
+    except Exception:
+        return False
+
+
+
     """
     Open the image just enough to read the EXIF date — no thumbnail, no resize.
     Much faster than a full scan. Returns None if date can't be read.
@@ -237,34 +257,26 @@ async def scan_directory(
     ]
     all_files.sort(key=lambda f: f.stat().st_mtime)
 
-    # Phase A: date pre-filter before any expensive image work
+    # Skip iCloud placeholder files — they aren't downloaded yet.
+    # Checking file attributes is instant and triggers no downloads.
+    local_files = [f for f in all_files if not _is_cloud_placeholder(f)]
+    skipped_cloud = len(all_files) - len(local_files)
+
+    # Date filter using EXIF (safe — files are already local)
     if start_date or end_date:
         if progress_callback:
-            progress_callback(0, len(all_files), "Reading photo dates...")
-
-        # Try Windows Shell property store first — reads iCloud metadata
-        # index without triggering any file downloads.
-        shell_dates = await asyncio.to_thread(_get_dates_via_shell_sync, directory)
-
-        if shell_dates is not None:
-            candidates = [
-                f for f in all_files
-                if _date_in_range(shell_dates.get(str(f).lower()), start_date, end_date)
-            ]
-        else:
-            # Fallback: EXIF-only PIL read (will trigger iCloud downloads on
-            # placeholder files — unavoidable without Windows Shell API)
-            candidates = []
-            for i, f in enumerate(all_files):
-                if progress_callback and i % 100 == 0:
-                    progress_callback(i, len(all_files), f.name)
-                d = await asyncio.to_thread(_read_exif_date_only, f)
-                if _date_in_range(d, start_date, end_date):
-                    candidates.append(f)
+            progress_callback(0, len(local_files), "Checking dates...")
+        candidates = []
+        for i, f in enumerate(local_files):
+            if progress_callback and i % 100 == 0:
+                progress_callback(i, len(local_files), f.name)
+            d = await asyncio.to_thread(_read_exif_date_only, f)
+            if _date_in_range(d, start_date, end_date):
+                candidates.append(f)
     else:
-        candidates = all_files
+        candidates = local_files
 
-    # Phase B: full scan (thumbnails + base64) on filtered candidates only
+    # Full scan (thumbnails + base64) on filtered local files only
     results = []
     for i, file_path in enumerate(candidates):
         if progress_callback:
@@ -272,7 +284,7 @@ async def scan_directory(
         result = await asyncio.to_thread(scan_photo, str(file_path))
         results.append(result)
 
-    return results
+    return results, skipped_cloud
 
 
 def sort_by_timestamp(results: list[PhotoScanResult]) -> list[PhotoScanResult]:

@@ -194,8 +194,13 @@ function DirectoryScanTab() {
           )}
 
           {/* Filtering summary chips */}
-          {(job.date_filtered ?? 0) > 0 || (job.prefilter_passed != null) ? (
+          {((job.cloud_skipped ?? 0) > 0 || (job.date_filtered ?? 0) > 0 || job.prefilter_passed != null) && (
             <div className="flex flex-wrap gap-2">
+              {(job.cloud_skipped ?? 0) > 0 && (
+                <span className="text-xs bg-gray-100 text-gray-600 border border-gray-200 px-2 py-0.5 rounded-full">
+                  {job.cloud_skipped?.toLocaleString()} not downloaded (iCloud) — skipped
+                </span>
+              )}
               {(job.date_filtered ?? 0) > 0 && (
                 <span className="text-xs bg-blue-50 text-blue-700 border border-blue-100 px-2 py-0.5 rounded-full">
                   {job.date_filtered} skipped by date
@@ -207,7 +212,7 @@ function DirectoryScanTab() {
                 </span>
               )}
             </div>
-          ) : null}
+          )}
 
           {job.status === "complete" && (
             <div className="bg-green-50 border border-green-100 rounded-xl p-3 text-sm text-green-700">
