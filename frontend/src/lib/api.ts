@@ -31,6 +31,7 @@ export function scanDirectory(
   startDate?: string,
   endDate?: string,
   usePrefilter = true,
+  childId?: number,
 ) {
   return request<{ session_id: string; message: string }>("/photos/scan", {
     method: "POST",
@@ -40,6 +41,7 @@ export function scanDirectory(
       start_date: startDate || null,
       end_date: endDate || null,
       use_prefilter: usePrefilter,
+      child_id: childId ?? null,
     }),
   });
 }

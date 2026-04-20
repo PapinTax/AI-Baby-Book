@@ -1,6 +1,9 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
-import { scanDirectory, openScanStream, ScanJobState, uploadPhoto, UploadResult } from "@/lib/api";
+import {
+  scanDirectory, openScanStream, ScanJobState,
+  uploadPhoto, UploadResult, listChildren, Child,
+} from "@/lib/api";
 import ConfidenceBadge from "@/components/ConfidenceBadge";
 import clsx from "clsx";
 
@@ -8,7 +11,6 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 // ─── Directory scan tab ────────────────────────────────────────────────────
 
-// Oldest child DOB — used as the default start date
 const DEFAULT_START = "2024-01-30";
 const DEFAULT_END = new Date().toISOString().slice(0, 10);
 
@@ -23,9 +25,27 @@ function DirectoryScanTab() {
   const [startDate, setStartDate] = useState(DEFAULT_START);
   const [endDate, setEndDate] = useState(DEFAULT_END);
   const [usePrefilter, setUsePrefilter] = useState(true);
+  const [selectedChildId, setSelectedChildId] = useState<number | "">("");
+  const [children, setChildren] = useState<Child[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
+
+  // Load children on mount for the "Scan for child" selector
+  useEffect(() => {
+    listChildren().then(setChildren).catch(() => {});
+  }, []);
+
+  // When a child is selected, pre-fill the date range from their birth date
+  const handleChildSelect = (childId: number | "") => {
+    setSelectedChildId(childId);
+    if (childId === "") return;
+    const child = children.find((c) => c.id === childId);
+    if (child?.birth_date) {
+      setStartDate(child.birth_date.slice(0, 10));
+      setEndDate(DEFAULT_END);
+    }
+  };
 
   const startScan = async () => {
     if (!directory.trim()) return;
@@ -34,6 +54,7 @@ function DirectoryScanTab() {
         directory.trim(), minConfidence,
         startDate || undefined, endDate || undefined,
         usePrefilter,
+        selectedChildId !== "" ? selectedChildId : undefined,
       );
       setSessionId(res.session_id);
       setJob({ status: "listing", scanned: 0, total: 0, detected: 0 });
@@ -80,6 +101,28 @@ function DirectoryScanTab() {
 
   return (
     <div className="space-y-5">
+      {/* Scan for child — pre-fills date range from birth date */}
+      {children.length > 0 && (
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Scan for child <span className="text-gray-400 font-normal">(optional)</span>
+          </label>
+          <select
+            value={selectedChildId}
+            onChange={(e) => handleChildSelect(e.target.value === "" ? "" : Number(e.target.value))}
+            className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400"
+          >
+            <option value="">All children / no auto-assign</option>
+            {children.map((c) => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </select>
+          <p className="text-xs text-gray-400 mt-1">
+            Selecting a child sets the date range from their birth date and auto-assigns all detected milestones — no manual assignment needed.
+          </p>
+        </div>
+      )}
+
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">
           Photo directory path

@@ -78,6 +78,7 @@ class ScanRequest(BaseModel):
     start_date: Optional[datetime.date] = None
     end_date: Optional[datetime.date] = None
     use_prefilter: bool = True
+    child_id: Optional[int] = None   # when set, auto-assigns all detections to this child
 
 
 class ScanResponse(BaseModel):
@@ -115,9 +116,11 @@ async def _run_scan(
     start_date: Optional[datetime.date],
     end_date: Optional[datetime.date],
     use_prefilter: bool,
+    child_id: Optional[int] = None,
 ):
     """Background task: list → date filter → read → prefilter → detect → persist."""
     from database import SessionLocal
+    from models import Child
 
     job = {
         "status": "listing", "scanned": 0, "total": 0, "detected": 0,
@@ -236,11 +239,18 @@ async def _run_scan(
         # ── Phase 6: persist ─────────────────────────────────────────────────
         job["status"] = "saving"
         async with SessionLocal() as db:
+            # Pre-load child birth date once (used for age computation below)
+            child_birth_date: Optional[datetime.date] = None
+            if child_id is not None:
+                child_obj = await db.get(Child, child_id)
+                if child_obj and child_obj.birth_date:
+                    bd = child_obj.birth_date
+                    child_birth_date = bd.date() if isinstance(bd, datetime.datetime) else bd
+
             for scan_result in photos:
                 thumb_filename = await asyncio.to_thread(
                     save_thumbnail_to_disk, scan_result, THUMBNAILS_DIR
                 )
-                # Upsert photo
                 stmt = select(Photo).where(Photo.file_path == scan_result.file_path)
                 existing = (await db.execute(stmt)).scalar_one_or_none()
                 if not existing:
@@ -277,13 +287,34 @@ async def _run_scan(
                 ).scalar_one_or_none()
                 if already_exists:
                     continue
+
+                # Compute exact age if child + birth date + photo date are all known
+                age_str = det.approximate_age
+                if child_birth_date and photo.taken_at:
+                    delta = (photo.taken_at.date() - child_birth_date).days
+                    if delta >= 0:
+                        years, rem = divmod(delta, 365)
+                        months = rem // 30
+                        if years == 0 and months == 0:
+                            age_str = "newborn"
+                        elif years == 0:
+                            age_str = f"{months} month{'s' if months != 1 else ''}"
+                        elif months == 0:
+                            age_str = f"{years} year{'s' if years != 1 else ''}"
+                        else:
+                            age_str = (
+                                f"{years} year{'s' if years != 1 else ''}, "
+                                f"{months} month{'s' if months != 1 else ''}"
+                            )
+
                 milestone = Milestone(
                     photo_id=photo.id,
+                    child_id=child_id,
                     milestone_type=det.milestone_type or "memorable_moment",
                     label=det.label,
                     description=det.description,
                     confidence=det.confidence,
-                    approximate_age=det.approximate_age,
+                    approximate_age=age_str,
                     evidence=det.evidence,
                 )
                 db.add(milestone)
@@ -304,7 +335,7 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     session_id = str(uuid.uuid4())
     background_tasks.add_task(
         _run_scan, session_id, req.directory, req.min_confidence, req.model,
-        req.start_date, req.end_date, req.use_prefilter,
+        req.start_date, req.end_date, req.use_prefilter, req.child_id,
     )
     return ScanResponse(session_id=session_id, message="Scan started")
 
