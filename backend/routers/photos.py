@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db
 from models import Photo, Milestone
 from services.photo_scanner import scan_directory, scan_photo, sort_by_timestamp, save_thumbnail_to_disk
-from services.milestone_detector import detect_milestones_batch, detect_milestone
+from services.milestone_detector import detect_milestones_batch, detect_milestone, prefilter_has_child
 
 THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "./uploads")
@@ -39,6 +39,9 @@ class ScanRequest(BaseModel):
     directory: str
     min_confidence: float = 0.5
     model: str = "claude-haiku-4-5-20251001"
+    start_date: Optional[datetime.date] = None
+    end_date: Optional[datetime.date] = None
+    use_prefilter: bool = True
 
 
 class ScanResponse(BaseModel):
@@ -73,11 +76,17 @@ async def _run_scan(
     directory: str,
     min_confidence: float,
     model: str,
+    start_date: Optional[datetime.date],
+    end_date: Optional[datetime.date],
+    use_prefilter: bool,
 ):
-    """Background task: scan dir → detect milestones → persist to DB."""
+    """Background task: scan dir → date filter → prefilter → detect milestones → persist to DB."""
     from database import SessionLocal
 
-    _scan_jobs[session_id] = {"status": "scanning", "scanned": 0, "total": 0, "detected": 0}
+    _scan_jobs[session_id] = {
+        "status": "scanning", "scanned": 0, "total": 0, "detected": 0,
+        "date_filtered": 0, "prefilter_passed": 0, "prefilter_total": 0,
+    }
 
     try:
         # Phase 1: scan photos
@@ -86,9 +95,43 @@ async def _run_scan(
 
         photos = await scan_directory(directory, progress_callback=on_scan_progress)
         photos = sort_by_timestamp(photos)
+
+        # Phase 2: date range filter (free — no API calls)
+        if start_date or end_date:
+            before = len(photos)
+            def in_range(r):
+                if not r.taken_at:
+                    return True
+                d = r.taken_at.date()
+                if start_date and d < start_date:
+                    return False
+                if end_date and d > end_date:
+                    return False
+                return True
+            photos = [r for r in photos if in_range(r)]
+            _scan_jobs[session_id]["date_filtered"] = before - len(photos)
+            _scan_jobs[session_id]["total"] = len(photos)
+
+        # Phase 3: prefilter — cheap yes/no "does this contain a child?" check
+        if use_prefilter and photos:
+            _scan_jobs[session_id]["status"] = "prefiltering"
+            _scan_jobs[session_id]["prefilter_total"] = len(photos)
+            passed = []
+            for i, photo in enumerate(photos):
+                _scan_jobs[session_id].update({
+                    "prefilter_checked": i + 1,
+                    "current_file": photo.filename,
+                })
+                has_child = await asyncio.to_thread(prefilter_has_child, photo, model)
+                if has_child:
+                    passed.append(photo)
+            _scan_jobs[session_id]["prefilter_passed"] = len(passed)
+            _scan_jobs[session_id]["total"] = len(passed)
+            photos = passed
+
         _scan_jobs[session_id]["status"] = "detecting"
 
-        # Phase 2: detect milestones
+        # Phase 4: detect milestones
         def on_detect_progress(current, total, filename):
             _scan_jobs[session_id].update({"detected": current, "total": total, "current_file": filename})
 
@@ -169,7 +212,8 @@ async def start_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     """Start an async directory scan. Poll /photos/scan/{session_id} for progress."""
     session_id = str(uuid.uuid4())
     background_tasks.add_task(
-        _run_scan, session_id, req.directory, req.min_confidence, req.model
+        _run_scan, session_id, req.directory, req.min_confidence, req.model,
+        req.start_date, req.end_date, req.use_prefilter,
     )
     return ScanResponse(session_id=session_id, message="Scan started")
 

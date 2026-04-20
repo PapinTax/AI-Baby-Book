@@ -25,10 +25,22 @@ export interface Photo {
   thumbnail_url: string | null;
 }
 
-export function scanDirectory(directory: string, minConfidence = 0.5) {
+export function scanDirectory(
+  directory: string,
+  minConfidence = 0.5,
+  startDate?: string,
+  endDate?: string,
+  usePrefilter = true,
+) {
   return request<{ session_id: string; message: string }>("/photos/scan", {
     method: "POST",
-    body: JSON.stringify({ directory, min_confidence: minConfidence }),
+    body: JSON.stringify({
+      directory,
+      min_confidence: minConfidence,
+      start_date: startDate || null,
+      end_date: endDate || null,
+      use_prefilter: usePrefilter,
+    }),
   });
 }
 
@@ -51,6 +63,10 @@ export type ScanJobState = {
   detected: number;
   current_file?: string;
   milestone_count?: number;
+  date_filtered?: number;
+  prefilter_total?: number;
+  prefilter_checked?: number;
+  prefilter_passed?: number;
   error?: string;
 };
 

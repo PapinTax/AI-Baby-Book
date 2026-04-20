@@ -150,6 +150,44 @@ def _parse_response(raw: str, photo_path: str) -> MilestoneDetection:
         )
 
 
+PREFILTER_PROMPT = (
+    "Does this photo contain a baby or young child (under 5 years old) as the main subject? "
+    "Reply with only a single word: yes or no."
+)
+
+
+def prefilter_has_child(photo: PhotoScanResult, model: str = DEFAULT_MODEL) -> bool:
+    """
+    Cheap yes/no check using the thumbnail. Returns True if a child is detected,
+    True on any error (fail open so we don't miss milestones).
+    Call via asyncio.to_thread.
+    """
+    if not photo.thumbnail_b64:
+        return True
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": photo.media_type,
+                            "data": photo.thumbnail_b64,
+                        },
+                    },
+                    {"type": "text", "text": PREFILTER_PROMPT},
+                ],
+            }],
+        )
+        return response.content[0].text.strip().lower().startswith("yes")
+    except anthropic.APIError:
+        return True
+
+
 def detect_milestone(photo: PhotoScanResult, model: str = DEFAULT_MODEL) -> MilestoneDetection:
     """
     Synchronous milestone detection for a single photo.
