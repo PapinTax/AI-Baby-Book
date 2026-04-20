@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Optional
 
 from PIL import Image, ExifTags
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
 THUMBNAIL_SIZE = (400, 400)
