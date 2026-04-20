@@ -210,10 +210,8 @@ def _is_cloud_placeholder(path: Path) -> bool:
 
 
 
-    """
-    Open the image just enough to read the EXIF date — no thumbnail, no resize.
-    Much faster than a full scan. Returns None if date can't be read.
-    """
+def _read_exif_date_only(file_path: Path) -> Optional[datetime.date]:
+    """Open image just enough to read EXIF date — no thumbnail, no resize."""
     try:
         with Image.open(file_path) as img:
             dt = _extract_taken_at(img)
@@ -262,25 +260,25 @@ async def scan_directory(
     local_files = [f for f in all_files if not _is_cloud_placeholder(f)]
     skipped_cloud = len(all_files) - len(local_files)
 
-    # Date filter using EXIF (safe — files are already local)
+    # Phase A: date filter using EXIF (safe — files are already local)
     if start_date or end_date:
         if progress_callback:
-            progress_callback(0, len(local_files), "Checking dates...")
+            progress_callback(0, len(local_files), "Checking dates...", "date_checking")
         candidates = []
         for i, f in enumerate(local_files):
             if progress_callback and i % 100 == 0:
-                progress_callback(i, len(local_files), f.name)
+                progress_callback(i, len(local_files), f.name, "date_checking")
             d = await asyncio.to_thread(_read_exif_date_only, f)
             if _date_in_range(d, start_date, end_date):
                 candidates.append(f)
     else:
         candidates = local_files
 
-    # Full scan (thumbnails + base64) on filtered local files only
+    # Phase B: full scan (thumbnails + base64) on filtered local files only
     results = []
     for i, file_path in enumerate(candidates):
         if progress_callback:
-            progress_callback(i + 1, len(candidates), file_path.name)
+            progress_callback(i + 1, len(candidates), file_path.name, "scanning")
         result = await asyncio.to_thread(scan_photo, str(file_path))
         results.append(result)
 

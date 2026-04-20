@@ -91,9 +91,8 @@ async def _run_scan(
 
     try:
         # Phase 1: scan — skips iCloud placeholders, date-filters locally
-        def on_scan_progress(current, total, filename):
-            status = "date_checking" if (start_date or end_date) and current < total else "scanning"
-            _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename, "status": status})
+        def on_scan_progress(current, total, filename, phase="scanning"):
+            _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename, "status": phase})
 
         photos, cloud_skipped = await scan_directory(
             directory,
