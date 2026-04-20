@@ -111,6 +111,16 @@ export default function TimelinePage() {
             >
               Export PDF
             </a>
+            {children.length > 1 && (
+              <a
+                href={`${API}/timeline/export/pdf/full`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="bg-brand-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:bg-brand-700 transition"
+              >
+                Family Book PDF
+              </a>
+            )}
           </div>
         </div>
 

@@ -16,6 +16,12 @@ THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
 # Must exist before StaticFiles mount below
 Path(THUMBNAILS_DIR).mkdir(parents=True, exist_ok=True)
 
+# ALLOWED_ORIGINS="*" (default dev) or comma-separated list for production
+# e.g. ALLOWED_ORIGINS=https://myapp.com,http://192.168.1.42:3000
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",")]
+_wildcard = ALLOWED_ORIGINS == ["*"]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,8 +38,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    # Credentials (cookies) cannot be sent with wildcard origin per CORS spec
+    allow_credentials=not _wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )

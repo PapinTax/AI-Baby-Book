@@ -9,10 +9,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from database import get_db
+from models import Child
 from services.timeline import get_timeline, deduplicate_timeline
-from services.exporter import generate_pdf
+from services.exporter import generate_pdf, generate_full_pdf
 
 router = APIRouter(prefix="/timeline", tags=["timeline"])
 
@@ -68,10 +70,36 @@ async def export_pdf(
     )
 
 
+@router.get("/export/pdf/full")
+async def export_full_pdf(db: AsyncSession = Depends(get_db)):
+    """Generate a combined family PDF with a chapter per child."""
+    children = (await db.execute(select(Child).order_by(Child.name))).scalars().all()
+
+    sections = []
+    for child in children:
+        entries = await get_timeline(db, child_id=child.id, approved_only=True)
+        entries = deduplicate_timeline(entries)
+        if entries:
+            sections.append((child.name, entries))
+
+    # Fall back to all approved milestones if no children are configured
+    if not sections:
+        entries = await get_timeline(db, approved_only=True)
+        entries = deduplicate_timeline(entries)
+        sections = [("Baby", entries)]
+
+    pdf_bytes = generate_full_pdf(sections)
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="family_baby_book.pdf"'},
+    )
+
+
 @router.get("/stats")
 async def timeline_stats(db: AsyncSession = Depends(get_db)):
     """Summary stats for the dashboard."""
-    from sqlalchemy import select, func
+    from sqlalchemy import func
     from models import Milestone, Photo
 
     total_photos = (await db.execute(select(func.count(Photo.id)))).scalar()

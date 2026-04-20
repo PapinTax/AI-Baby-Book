@@ -129,21 +129,30 @@ async def _run_scan(
 
             await db.flush()
 
-            # Persist detections
+            # Persist detections — skip photos that already have a milestone
+            # to avoid duplicates on re-scan
             for det in detections:
                 stmt = select(Photo).where(Photo.file_path == det.photo_path)
                 photo = (await db.execute(stmt)).scalar_one_or_none()
-                if photo:
-                    milestone = Milestone(
-                        photo_id=photo.id,
-                        milestone_type=det.milestone_type or "memorable_moment",
-                        label=det.label,
-                        description=det.description,
-                        confidence=det.confidence,
-                        approximate_age=det.approximate_age,
-                        evidence=det.evidence,
+                if not photo:
+                    continue
+                already_exists = (
+                    await db.execute(
+                        select(Milestone).where(Milestone.photo_id == photo.id).limit(1)
                     )
-                    db.add(milestone)
+                ).scalar_one_or_none()
+                if already_exists:
+                    continue
+                milestone = Milestone(
+                    photo_id=photo.id,
+                    milestone_type=det.milestone_type or "memorable_moment",
+                    label=det.label,
+                    description=det.description,
+                    confidence=det.confidence,
+                    approximate_age=det.approximate_age,
+                    evidence=det.evidence,
+                )
+                db.add(milestone)
 
             await db.commit()
 
