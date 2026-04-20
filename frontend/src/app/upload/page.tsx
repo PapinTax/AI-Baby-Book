@@ -301,7 +301,7 @@ function SingleUploadTab() {
         <input
           ref={inputRef}
           type="file"
-          accept="image/*"
+          accept="image/*,video/mp4,video/quicktime,video/x-msvideo,video/x-matroska,video/3gpp"
           className="hidden"
           onChange={onFileChange}
         />
@@ -310,7 +310,7 @@ function SingleUploadTab() {
           {uploading ? "Analyzing photo..." : "Drop a photo here, or click to select"}
         </p>
         <p className="text-xs text-gray-400 mt-1">
-          JPEG, PNG, HEIC, WebP — Claude Vision will detect milestones instantly
+          JPEG, PNG, HEIC, WebP, MOV, MP4 — Claude Vision will detect milestones instantly
         </p>
       </div>
 

@@ -23,6 +23,9 @@ except ImportError:
     pass
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
+IMAGE_EXTENSIONS = SUPPORTED_EXTENSIONS
+VIDEO_EXTENSIONS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp"}
+SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 THUMBNAIL_SIZE = (400, 400)
 MAX_CLAUDE_IMAGE_SIZE = (1024, 1024)
 
@@ -201,19 +204,142 @@ def scan_photo(file_path: str, include_full: bool = False) -> PhotoScanResult:
 
 def hydrate_full_b64(result: PhotoScanResult) -> PhotoScanResult:
     """
-    Re-open the source file and populate full_b64 on an existing scan result.
-    Used to defer the expensive 1024px encode until after prefiltering, so we
-    only pay that cost for photos that will actually be sent to Claude.
-    No-op if full_b64 is already present or the source file is gone.
+    Populate full_b64 on an existing scan result that was scanned without it.
+    Dispatches to video or image path automatically. No-op if already hydrated.
     """
     if result.full_b64 or result.error:
         return result
+    ext = Path(result.file_path).suffix.lower()
+    if ext in VIDEO_EXTENSIONS:
+        try:
+            import cv2
+            import numpy as np
+            cap = cv2.VideoCapture(result.file_path)
+            try:
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_count // 2))
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(rgb)
+                    result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
+            finally:
+                cap.release()
+        except Exception as e:
+            result.error = str(e)
+    else:
+        try:
+            with Image.open(result.file_path) as img:
+                result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
+        except Exception as e:
+            result.error = str(e)
+    return result
+
+
+def _extract_video_date(path: Path) -> Optional[datetime.datetime]:
+    """
+    Try ffprobe for the QuickTime/MP4 creation_time tag, then fall back to
+    the file's mtime. ffprobe is optional — if absent, mtime is used silently.
+    """
     try:
-        with Image.open(result.file_path) as img:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_entries", "format_tags=creation_time",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout)
+            ct = (data.get("format") or {}).get("tags", {}).get("creation_time")
+            if ct:
+                return datetime.datetime.fromisoformat(
+                    ct.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+    except Exception:
+        pass
+    try:
+        return datetime.datetime.fromtimestamp(path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def _best_video_frame(file_path: str) -> Optional[Image.Image]:
+    """
+    Open a video and return the sharpest frame from 5 evenly-spaced samples.
+    Returns None if the file cannot be read.
+    """
+    try:
+        import cv2
+        import numpy as np
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            return None
+        try:
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if frame_count <= 0:
+                return None
+            positions = [max(0, int(frame_count * p)) for p in (0.20, 0.35, 0.50, 0.65, 0.80)]
+            best_frame, best_score = None, -1.0
+            for pos in positions:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                if score > best_score:
+                    best_score = score
+                    best_frame = frame
+            if best_frame is None:
+                return None
+            rgb = cv2.cvtColor(best_frame, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb)
+        finally:
+            cap.release()
+    except Exception:
+        return None
+
+
+def scan_video(file_path: str, include_full: bool = False) -> PhotoScanResult:
+    """
+    Extract the sharpest frame from a video and return it as a PhotoScanResult.
+    Date comes from QuickTime/MP4 metadata (via ffprobe) or file mtime.
+    """
+    path = Path(file_path)
+    result = PhotoScanResult(
+        file_path=file_path,
+        filename=path.name,
+        taken_at=None,
+        file_size=0,
+        width=None,
+        height=None,
+        thumbnail_b64=None,
+        full_b64=None,
+    )
+    try:
+        result.file_size = path.stat().st_size
+        result.taken_at = _extract_video_date(path)
+        img = _best_video_frame(file_path)
+        if img is None:
+            result.error = "Could not extract frame from video"
+            return result
+        result.width, result.height = img.size
+        result.thumbnail_b64 = _image_to_b64(img, THUMBNAIL_SIZE)
+        if include_full:
             result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
     except Exception as e:
         result.error = str(e)
     return result
+
+
+def scan_file(file_path: str, include_full: bool = False) -> PhotoScanResult:
+    """Dispatch to scan_video or scan_photo based on file extension."""
+    if Path(file_path).suffix.lower() in VIDEO_EXTENSIONS:
+        return scan_video(file_path, include_full=include_full)
+    return scan_photo(file_path, include_full=include_full)
 
 
 def _is_cloud_placeholder(path: Path) -> bool:
@@ -238,13 +364,21 @@ def _is_cloud_placeholder(path: Path) -> bool:
 
 
 def _read_exif_date_only(file_path: Path) -> Optional[datetime.date]:
-    """Open image just enough to read EXIF date — no thumbnail, no resize."""
+    """Read EXIF date from an image without generating a thumbnail."""
     try:
         with Image.open(file_path) as img:
             dt = _extract_taken_at(img)
             return dt.date() if dt else None
     except Exception:
         return None
+
+
+def _read_date_only(file_path: Path) -> Optional[datetime.date]:
+    """Date-only read for any supported file type (image or video)."""
+    if file_path.suffix.lower() in VIDEO_EXTENSIONS:
+        dt = _extract_video_date(file_path)
+        return dt.date() if dt else None
+    return _read_exif_date_only(file_path)
 
 
 def _date_in_range(
@@ -301,7 +435,7 @@ async def filter_files_by_exif_date(
     async def check(f: Path) -> tuple[Path, bool]:
         nonlocal done
         async with sem:
-            d = await asyncio.to_thread(_read_exif_date_only, f)
+            d = await asyncio.to_thread(_read_date_only, f)
         done += 1
         if progress_callback and (done % 25 == 0 or done == total):
             progress_callback(done, total, f.name)
@@ -328,7 +462,7 @@ async def scan_files(
     async def one(f: Path) -> PhotoScanResult:
         nonlocal done
         async with sem:
-            r = await asyncio.to_thread(scan_photo, str(f), include_full)
+            r = await asyncio.to_thread(scan_file, str(f), include_full)
         done += 1
         if progress_callback and (done % 5 == 0 or done == total):
             progress_callback(done, total, f.name)

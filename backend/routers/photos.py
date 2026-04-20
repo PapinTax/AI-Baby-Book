@@ -27,6 +27,7 @@ from services.photo_scanner import (
     list_photo_files,
     filter_files_by_exif_date,
     scan_files,
+    scan_file,
     scan_photo,
     sort_by_timestamp,
     save_thumbnail_to_disk,
@@ -402,7 +403,7 @@ async def upload_photo(
         f.write(content)
 
     # Scan & detect — include_full=True since we're sending to Claude immediately
-    scan_result = await asyncio.to_thread(scan_photo, dest_path, True)
+    scan_result = await asyncio.to_thread(scan_file, dest_path, True)
     if scan_result.error:
         raise HTTPException(status_code=422, detail=f"Could not read image: {scan_result.error}")
 
