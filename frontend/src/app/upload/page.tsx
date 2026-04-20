@@ -50,11 +50,12 @@ function DirectoryScanTab() {
     return () => cleanupRef.current?.();
   }, [sessionId]);
 
-  const phaseLabel: Record<ScanPhase, string> = {
+  const phaseLabel: Record<string, string> = {
     idle: "",
-    scanning: "Reading photos and extracting dates...",
-    prefiltering: "Pre-filtering: checking for children in photos...",
-    detecting: "Detecting milestones with Claude Vision...",
+    date_checking: "Step 1/3 — Checking photo dates (no AI yet)...",
+    scanning: "Step 2/3 — Reading filtered photos...",
+    prefiltering: "Step 2/3 — Pre-filtering: checking for children...",
+    detecting: "Step 3/3 — Detecting milestones with Claude Vision...",
     saving: "Saving results...",
     complete: "Scan complete!",
     error: "Scan failed",

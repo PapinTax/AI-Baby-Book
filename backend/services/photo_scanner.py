@@ -122,35 +122,31 @@ def scan_photo(file_path: str) -> PhotoScanResult:
     return result
 
 
-def _file_date_in_range(
-    path: Path,
+def _read_exif_date_only(file_path: Path) -> Optional[datetime.date]:
+    """
+    Open the image just enough to read the EXIF date — no thumbnail, no resize.
+    Much faster than a full scan. Returns None if date can't be read.
+    """
+    try:
+        with Image.open(file_path) as img:
+            dt = _extract_taken_at(img)
+            return dt.date() if dt else None
+    except Exception:
+        return None
+
+
+def _date_in_range(
+    d: Optional[datetime.date],
     start_date: Optional[datetime.date],
     end_date: Optional[datetime.date],
 ) -> bool:
-    """
-    Quick file-system date check using st_mtime and st_ctime.
-    No image opening needed — used to skip files before the expensive PIL scan.
-    Returns True if the file MIGHT be in range (fail-open).
-    """
-    if not start_date and not end_date:
-        return True
-    try:
-        stat = path.stat()
-        dates = [
-            datetime.datetime.fromtimestamp(stat.st_mtime).date(),
-            datetime.datetime.fromtimestamp(stat.st_ctime).date(),
-        ]
-        for d in dates:
-            in_range = True
-            if start_date and d < start_date:
-                in_range = False
-            if end_date and d > end_date:
-                in_range = False
-            if in_range:
-                return True
+    if d is None:
+        return True  # no date → include (fail-open)
+    if start_date and d < start_date:
         return False
-    except OSError:
-        return True  # can't stat → include it
+    if end_date and d > end_date:
+        return False
+    return True
 
 
 async def scan_directory(
@@ -161,9 +157,8 @@ async def scan_directory(
 ) -> list[PhotoScanResult]:
     """
     Walk a directory and scan supported image files.
-    start_date/end_date do a fast file-system pre-check before opening images,
-    so only in-range files pay the PIL cost.
-    progress_callback(current, total, filename) called for each file processed.
+    When date range is provided, does a fast EXIF-date-only pass first so the
+    expensive thumbnail/base64 generation only runs on in-range files.
     """
     dir_path = Path(directory)
     if not dir_path.is_dir():
@@ -175,9 +170,21 @@ async def scan_directory(
     ]
     all_files.sort(key=lambda f: f.stat().st_mtime)
 
-    # Fast file-system date pre-filter — no image opening
-    candidates = [f for f in all_files if _file_date_in_range(f, start_date, end_date)]
+    # Phase A: quick EXIF-date-only read to filter before expensive full scan
+    if start_date or end_date:
+        if progress_callback:
+            progress_callback(0, len(all_files), "Checking dates...")
+        candidates = []
+        for i, f in enumerate(all_files):
+            if progress_callback and i % 100 == 0:
+                progress_callback(i, len(all_files), f.name)
+            d = await asyncio.to_thread(_read_exif_date_only, f)
+            if _date_in_range(d, start_date, end_date):
+                candidates.append(f)
+    else:
+        candidates = all_files
 
+    # Phase B: full scan (thumbnails + base64) on filtered candidates only
     results = []
     for i, file_path in enumerate(candidates):
         if progress_callback:

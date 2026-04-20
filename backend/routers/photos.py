@@ -89,12 +89,10 @@ async def _run_scan(
     }
 
     try:
-        # Phase 1: scan photos
+        # Phase 1: scan photos (with built-in EXIF date pre-filter)
         def on_scan_progress(current, total, filename):
-            _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename})
-
-        # Pass dates into scan_directory so the fast file-system pre-check
-        # runs before PIL opens any image — skips the bulk of the library cheaply.
+            status = "date_checking" if (start_date or end_date) and current < total else "scanning"
+            _scan_jobs[session_id].update({"scanned": current, "total": total, "current_file": filename, "status": status})
         photos = await scan_directory(
             directory,
             progress_callback=on_scan_progress,
