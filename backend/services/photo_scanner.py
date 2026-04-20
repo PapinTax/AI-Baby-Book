@@ -7,7 +7,10 @@ import base64
 import datetime
 import hashlib
 import io
+import json
 import os
+import platform
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,7 +24,66 @@ except ImportError:
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
 THUMBNAIL_SIZE = (400, 400)
-MAX_CLAUDE_IMAGE_SIZE = (1024, 1024)  # keeps API cost low
+MAX_CLAUDE_IMAGE_SIZE = (1024, 1024)
+
+
+# ── PowerShell Shell property reader (Windows / iCloud) ───────────────────────
+
+_PS_DATE_SCRIPT = r"""
+$dir = $env:SCAN_DIR
+$shell = New-Object -ComObject Shell.Application
+$nsCache = @{}
+$out = [System.Collections.Generic.List[object]]::new()
+Get-ChildItem $dir -Recurse -File | Where-Object {
+    $_.Extension -match '(?i)\.(heic|heif|jpg|jpeg|png|tiff|tif|webp)$'
+} | ForEach-Object {
+    $d = $_.DirectoryName
+    if (-not $nsCache.ContainsKey($d)) { $nsCache[$d] = $shell.NameSpace($d) }
+    $ns = $nsCache[$d]
+    $item = if ($ns) { $ns.ParseName($_.Name) } else { $null }
+    $dt = if ($item) { $item.ExtendedProperty('System.Photo.DateTaken') } else { $null }
+    $out.Add([PSCustomObject]@{
+        p = $_.FullName
+        d = if ($dt) { $dt.ToString('yyyy-MM-dd') } else { '' }
+    })
+}
+$out | ConvertTo-Json -Compress -Depth 1
+"""
+
+
+def _get_dates_via_shell_sync(directory: str) -> Optional[dict[str, Optional[datetime.date]]]:
+    """
+    Windows-only: read System.Photo.DateTaken from the Shell property store.
+    iCloud populates this from its local index — no file download triggered.
+    Returns None if not on Windows or if PowerShell fails.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        env = os.environ.copy()
+        env["SCAN_DIR"] = directory
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_DATE_SCRIPT],
+            capture_output=True, text=True, timeout=300, env=env,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        raw = json.loads(proc.stdout)
+        if isinstance(raw, dict):
+            raw = [raw]
+        result: dict[str, Optional[datetime.date]] = {}
+        for item in raw:
+            path = item.get("p", "").lower()
+            date_str = item.get("d", "")
+            if path:
+                result[path] = (
+                    datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                    if date_str else None
+                )
+        return result
+    except Exception:
+        return None
+
 
 
 @dataclass
@@ -175,17 +237,30 @@ async def scan_directory(
     ]
     all_files.sort(key=lambda f: f.stat().st_mtime)
 
-    # Phase A: quick EXIF-date-only read to filter before expensive full scan
+    # Phase A: date pre-filter before any expensive image work
     if start_date or end_date:
         if progress_callback:
-            progress_callback(0, len(all_files), "Checking dates...")
-        candidates = []
-        for i, f in enumerate(all_files):
-            if progress_callback and i % 100 == 0:
-                progress_callback(i, len(all_files), f.name)
-            d = await asyncio.to_thread(_read_exif_date_only, f)
-            if _date_in_range(d, start_date, end_date):
-                candidates.append(f)
+            progress_callback(0, len(all_files), "Reading photo dates...")
+
+        # Try Windows Shell property store first — reads iCloud metadata
+        # index without triggering any file downloads.
+        shell_dates = await asyncio.to_thread(_get_dates_via_shell_sync, directory)
+
+        if shell_dates is not None:
+            candidates = [
+                f for f in all_files
+                if _date_in_range(shell_dates.get(str(f).lower()), start_date, end_date)
+            ]
+        else:
+            # Fallback: EXIF-only PIL read (will trigger iCloud downloads on
+            # placeholder files — unavoidable without Windows Shell API)
+            candidates = []
+            for i, f in enumerate(all_files):
+                if progress_callback and i % 100 == 0:
+                    progress_callback(i, len(all_files), f.name)
+                d = await asyncio.to_thread(_read_exif_date_only, f)
+                if _date_in_range(d, start_date, end_date):
+                    candidates.append(f)
     else:
         candidates = all_files
 
