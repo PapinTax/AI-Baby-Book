@@ -122,28 +122,66 @@ def scan_photo(file_path: str) -> PhotoScanResult:
     return result
 
 
+def _file_date_in_range(
+    path: Path,
+    start_date: Optional[datetime.date],
+    end_date: Optional[datetime.date],
+) -> bool:
+    """
+    Quick file-system date check using st_mtime and st_ctime.
+    No image opening needed — used to skip files before the expensive PIL scan.
+    Returns True if the file MIGHT be in range (fail-open).
+    """
+    if not start_date and not end_date:
+        return True
+    try:
+        stat = path.stat()
+        dates = [
+            datetime.datetime.fromtimestamp(stat.st_mtime).date(),
+            datetime.datetime.fromtimestamp(stat.st_ctime).date(),
+        ]
+        for d in dates:
+            in_range = True
+            if start_date and d < start_date:
+                in_range = False
+            if end_date and d > end_date:
+                in_range = False
+            if in_range:
+                return True
+        return False
+    except OSError:
+        return True  # can't stat → include it
+
+
 async def scan_directory(
     directory: str,
     progress_callback=None,
+    start_date: Optional[datetime.date] = None,
+    end_date: Optional[datetime.date] = None,
 ) -> list[PhotoScanResult]:
     """
-    Walk a directory and scan all supported image files.
-    progress_callback(current, total, filename) called for each file.
+    Walk a directory and scan supported image files.
+    start_date/end_date do a fast file-system pre-check before opening images,
+    so only in-range files pay the PIL cost.
+    progress_callback(current, total, filename) called for each file processed.
     """
     dir_path = Path(directory)
     if not dir_path.is_dir():
         raise ValueError(f"Not a directory: {directory}")
 
-    files = [
+    all_files = [
         f for f in dir_path.rglob("*")
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
-    files.sort(key=lambda f: f.stat().st_mtime)
+    all_files.sort(key=lambda f: f.stat().st_mtime)
+
+    # Fast file-system date pre-filter — no image opening
+    candidates = [f for f in all_files if _file_date_in_range(f, start_date, end_date)]
 
     results = []
-    for i, file_path in enumerate(files):
+    for i, file_path in enumerate(candidates):
         if progress_callback:
-            progress_callback(i + 1, len(files), file_path.name)
+            progress_callback(i + 1, len(candidates), file_path.name)
         result = await asyncio.to_thread(scan_photo, str(file_path))
         results.append(result)
 
