@@ -113,6 +113,7 @@ export interface Milestone {
   id: number;
   photo_id: number;
   child_id: number | null;
+  child_name: string | null;
   milestone_type: string;
   label: string;
   description: string | null;
@@ -137,6 +138,19 @@ export function reviewMilestone(id: number, approved: boolean, childId?: number)
   return request<Milestone>(`/milestones/${id}`, {
     method: "PATCH",
     body: JSON.stringify({ approved, child_id: childId ?? null }),
+  });
+}
+
+export function reassignChild(id: number, childId: number | null) {
+  return request<Milestone>(`/milestones/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ child_id: childId }),
+  });
+}
+
+export function deduplicateMilestones() {
+  return request<{ deleted: number; message: string }>("/milestones/deduplicate", {
+    method: "POST",
   });
 }
 

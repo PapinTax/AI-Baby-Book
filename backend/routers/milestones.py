@@ -2,7 +2,8 @@
 Milestone review and management endpoints.
 GET    /milestones/pending        — queue for user review (approve/reject)
 POST   /milestones/rescan         — re-run detection with Sonnet on low-confidence items
-PATCH  /milestones/{id}           — approve or reject
+POST   /milestones/deduplicate    — keep only earliest per (child_id, milestone_type)
+PATCH  /milestones/{id}           — approve/reject and/or reassign child
 GET    /milestones                — all milestones
 DELETE /milestones/{id}           — remove
 """
@@ -21,15 +22,24 @@ from services.timeline import get_pending_review
 
 router = APIRouter(prefix="/milestones", tags=["milestones"])
 
+# Milestone types where only the first occurrence matters per child.
+# birthday / vacation / holiday / memorable_moment repeat by design.
+_DEDUP_TYPES = {
+    "first_smile", "first_laugh", "tummy_time", "first_roll", "sitting_up",
+    "first_crawl", "first_pull_to_stand", "first_stand", "first_steps",
+    "first_walk", "first_solid_food", "first_birthday", "first_bath",
+    "first_tooth", "first_words",
+}
+
 
 class MilestoneReview(BaseModel):
-    approved: bool
+    approved: Optional[bool] = None   # None → don't change approved status
     child_id: Optional[int] = None
     label: Optional[str] = None
 
 
 class RescanRequest(BaseModel):
-    max_confidence: float = 0.75   # re-scan items below this threshold
+    max_confidence: float = 0.75
     limit: int = 50
     model: str = "claude-sonnet-4-6"
 
@@ -38,6 +48,7 @@ class MilestoneOut(BaseModel):
     id: int
     photo_id: int
     child_id: Optional[int]
+    child_name: Optional[str] = None
     milestone_type: str
     label: str
     description: Optional[str]
@@ -54,9 +65,23 @@ class MilestoneOut(BaseModel):
 
 
 def _thumb_url(thumbnail_path: Optional[str]) -> Optional[str]:
-    if thumbnail_path:
-        return f"/thumbnails/{thumbnail_path}"
-    return None
+    return f"/thumbnails/{thumbnail_path}" if thumbnail_path else None
+
+
+def _compute_age(birth_date: datetime.date, taken_at: datetime.datetime) -> Optional[str]:
+    """Return a human-readable age string like '3 months' or '1 year, 2 months'."""
+    delta_days = (taken_at.date() - birth_date).days
+    if delta_days < 0:
+        return None
+    years, rem = divmod(delta_days, 365)
+    months = rem // 30
+    if years == 0 and months == 0:
+        return "newborn"
+    if years == 0:
+        return f"{months} month{'s' if months != 1 else ''}"
+    if months == 0:
+        return f"{years} year{'s' if years != 1 else ''}"
+    return f"{years} year{'s' if years != 1 else ''}, {months} month{'s' if months != 1 else ''}"
 
 
 @router.get("/pending", response_model=list[MilestoneOut])
@@ -133,16 +158,34 @@ async def review_milestone(
     review: MilestoneReview,
     db: AsyncSession = Depends(get_db),
 ):
-    """Approve or reject a milestone detection."""
+    """Approve/reject a milestone and/or reassign its child."""
     milestone = await db.get(Milestone, milestone_id)
     if not milestone:
         raise HTTPException(status_code=404, detail="Milestone not found")
 
-    milestone.approved = review.approved
-    if review.child_id is not None:
+    if review.approved is not None:
+        milestone.approved = review.approved
+    if "child_id" in review.model_fields_set:
         milestone.child_id = review.child_id
     if review.label:
         milestone.label = review.label
+
+    # Recompute age whenever child is known and photo has a date
+    child_name: Optional[str] = None
+    if milestone.child_id is not None:
+        child = await db.get(Child, milestone.child_id)
+        photo = await db.get(Photo, milestone.photo_id)
+        if child:
+            child_name = child.name
+            if child.birth_date and photo and photo.taken_at:
+                age = _compute_age(
+                    child.birth_date.date()
+                    if isinstance(child.birth_date, datetime.datetime)
+                    else child.birth_date,
+                    photo.taken_at,
+                )
+                if age:
+                    milestone.approximate_age = age
 
     await db.commit()
     await db.refresh(milestone)
@@ -152,6 +195,7 @@ async def review_milestone(
         id=milestone.id,
         photo_id=milestone.photo_id,
         child_id=milestone.child_id,
+        child_name=child_name,
         milestone_type=milestone.milestone_type,
         label=milestone.label,
         description=milestone.description,
@@ -165,25 +209,74 @@ async def review_milestone(
     )
 
 
+@router.post("/deduplicate")
+async def deduplicate_milestones(db: AsyncSession = Depends(get_db)):
+    """
+    For each (child_id, milestone_type) pair where the type is a once-per-child event,
+    keep only the milestone from the earliest photo and delete later duplicates.
+    Only operates on approved milestones with an assigned child.
+    """
+    stmt = (
+        select(Milestone, Photo)
+        .join(Photo, Milestone.photo_id == Photo.id)
+        .where(
+            Milestone.approved == True,  # noqa: E712
+            Milestone.child_id.isnot(None),
+            Milestone.milestone_type.in_(_DEDUP_TYPES),
+        )
+        .order_by(Photo.taken_at.asc().nulls_last())
+    )
+    rows = (await db.execute(stmt)).all()
+
+    seen: set[tuple] = set()
+    to_delete: list[int] = []
+    for m, _ in rows:
+        key = (m.child_id, m.milestone_type)
+        if key in seen:
+            to_delete.append(m.id)
+        else:
+            seen.add(key)
+
+    for mid in to_delete:
+        obj = await db.get(Milestone, mid)
+        if obj:
+            await db.delete(obj)
+    await db.commit()
+    return {"deleted": len(to_delete), "message": f"Removed {len(to_delete)} duplicate milestone{'s' if len(to_delete) != 1 else ''}"}
+
+
 @router.get("", response_model=list[MilestoneOut])
 async def list_milestones(
     approved_only: bool = False,
     child_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(Milestone, Photo).join(Photo, Milestone.photo_id == Photo.id)
+    stmt = (
+        select(Milestone, Photo)
+        .join(Photo, Milestone.photo_id == Photo.id)
+    )
     if approved_only:
-        stmt = stmt.where(Milestone.approved == True)
+        stmt = stmt.where(Milestone.approved == True)  # noqa: E712
     if child_id is not None:
         stmt = stmt.where(Milestone.child_id == child_id)
     stmt = stmt.order_by(Photo.taken_at.asc().nulls_last())
 
     rows = (await db.execute(stmt)).all()
+
+    # Build child name lookup
+    child_ids = {m.child_id for m, _ in rows if m.child_id is not None}
+    child_names: dict[int, str] = {}
+    for cid in child_ids:
+        c = await db.get(Child, cid)
+        if c:
+            child_names[cid] = c.name
+
     return [
         MilestoneOut(
             id=m.id,
             photo_id=m.photo_id,
             child_id=m.child_id,
+            child_name=child_names.get(m.child_id) if m.child_id else None,
             milestone_type=m.milestone_type,
             label=m.label,
             description=m.description,

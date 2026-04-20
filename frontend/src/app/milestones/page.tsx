@@ -5,6 +5,7 @@ import {
   listMilestones,
   reviewMilestone,
   deleteMilestone,
+  deduplicateMilestones,
   listChildren,
   rescanLowConfidence,
   Milestone,
@@ -20,6 +21,7 @@ export default function MilestonesPage() {
   const [tab, setTab] = useState<"pending" | "approved">("pending");
   const [rescanning, setRescanning] = useState(false);
   const [rescanMsg, setRescanMsg] = useState<string | null>(null);
+  const [deduping, setDeduping] = useState(false);
   const [focusedIdx, setFocusedIdx] = useState(0);
   const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
 
@@ -40,7 +42,6 @@ export default function MilestonesPage() {
 
   useEffect(() => { load(); }, [tab]);
 
-  // Scroll focused card into view
   useEffect(() => {
     cardRefs.current[focusedIdx]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [focusedIdx]);
@@ -48,7 +49,6 @@ export default function MilestonesPage() {
   const removeFromList = (id: number) => {
     setMilestones((prev) => {
       const next = prev.filter((m) => m.id !== id);
-      // Keep focus within bounds after removal
       setFocusedIdx((i) => Math.min(i, Math.max(0, next.length - 1)));
       return next;
     });
@@ -69,6 +69,24 @@ export default function MilestonesPage() {
     removeFromList(id);
   };
 
+  const handleChildChange = useCallback(
+    (id: number, childId: number | null, approximateAge: string | null) => {
+      setMilestones((prev) =>
+        prev.map((m) =>
+          m.id === id
+            ? {
+                ...m,
+                child_id: childId,
+                child_name: children.find((c) => c.id === childId)?.name ?? null,
+                approximate_age: approximateAge ?? m.approximate_age,
+              }
+            : m
+        )
+      );
+    },
+    [children]
+  );
+
   const handleRescan = async () => {
     setRescanning(true);
     setRescanMsg(null);
@@ -83,7 +101,20 @@ export default function MilestonesPage() {
     }
   };
 
-  // Keyboard shortcuts — only active on pending tab
+  const handleDeduplicate = async () => {
+    setDeduping(true);
+    setRescanMsg(null);
+    try {
+      const res = await deduplicateMilestones();
+      setRescanMsg(res.message);
+      await load();
+    } catch (e: any) {
+      setRescanMsg(`Error: ${e.message}`);
+    } finally {
+      setDeduping(false);
+    }
+  };
+
   useReviewKeyboard({
     total: milestones.length,
     focusedIdx,
@@ -119,6 +150,16 @@ export default function MilestonesPage() {
               {rescanning ? "Re-scanning..." : "Re-scan with Sonnet"}
             </button>
           )}
+          {tab === "approved" && (
+            <button
+              onClick={handleDeduplicate}
+              disabled={deduping}
+              className="border border-amber-200 text-amber-700 text-sm px-4 py-1.5 rounded-lg hover:bg-amber-50 transition disabled:opacity-50"
+              title="Keep only the earliest photo per milestone type per child"
+            >
+              {deduping ? "Deduplicating..." : "Remove duplicates"}
+            </button>
+          )}
           {(["pending", "approved"] as const).map((t) => (
             <button
               key={t}
@@ -137,7 +178,7 @@ export default function MilestonesPage() {
 
       {rescanMsg && (
         <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-sm text-blue-700">
-          {rescanMsg} — results will refresh in a moment.
+          {rescanMsg}
         </div>
       )}
 
@@ -163,6 +204,7 @@ export default function MilestonesPage() {
             onApprove={handleApprove}
             onReject={handleReject}
             onRemove={handleRemove}
+            onChildChange={handleChildChange}
             onLabelChange={(id, label) =>
               setMilestones((prev) => prev.map((x) => (x.id === id ? { ...x, label } : x)))
             }
