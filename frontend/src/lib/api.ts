@@ -68,6 +68,9 @@ export type ScanJobState = {
   prefilter_checked?: number;
   prefilter_passed?: number;
   cloud_skipped?: number;
+  cached_skipped?: number;
+  face_total?: number;
+  face_passed?: number;
   error?: string;
 };
 

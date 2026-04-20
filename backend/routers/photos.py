@@ -30,8 +30,36 @@ from services.photo_scanner import (
     scan_photo,
     sort_by_timestamp,
     save_thumbnail_to_disk,
+    hydrate_full_b64,
 )
-from services.milestone_detector import detect_milestones_batch, detect_milestone, prefilter_has_child
+from services.milestone_detector import (
+    detect_milestones_batch,
+    detect_milestone,
+    prefilter_has_child,
+    prefilter_batch,
+)
+from services.face_detector import face_filter_batch
+
+
+async def _already_processed_keys(db: AsyncSession, paths: list[str]) -> set[tuple[str, int]]:
+    """
+    Look up which of the given file paths are already fully processed in the DB.
+    Returns the set of (file_path, file_size) tuples for processed rows.
+    Chunked to stay under SQLite's 999-parameter limit.
+    """
+    found: set[tuple[str, int]] = set()
+    CHUNK = 500
+    for i in range(0, len(paths), CHUNK):
+        chunk = paths[i:i + CHUNK]
+        stmt = select(Photo.file_path, Photo.file_size).where(
+            Photo.file_path.in_(chunk),
+            Photo.processed == True,  # noqa: E712 — SQLA wants ==
+        )
+        rows = (await db.execute(stmt)).all()
+        for path, size in rows:
+            if size is not None:
+                found.add((path, size))
+    return found
 
 THUMBNAILS_DIR = os.getenv("THUMBNAILS_DIR", "./thumbnails")
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "./uploads")
@@ -93,7 +121,8 @@ async def _run_scan(
     job = {
         "status": "listing", "scanned": 0, "total": 0, "detected": 0,
         "date_filtered": 0, "prefilter_passed": 0, "prefilter_total": 0,
-        "cloud_skipped": 0,
+        "cloud_skipped": 0, "cached_skipped": 0,
+        "face_total": 0, "face_passed": 0,
     }
     _scan_jobs[session_id] = job
 
@@ -102,7 +131,17 @@ async def _run_scan(
         local_files, cloud_skipped = await asyncio.to_thread(list_photo_files, directory)
         job["cloud_skipped"] = cloud_skipped
 
-        # ── Phase 2: fast EXIF date filter (no thumbnail work) ───────────────
+        # ── Phase 2: DB cache filter — skip already-processed files ──────────
+        async with SessionLocal() as db:
+            cached = await _already_processed_keys(db, [str(f) for f in local_files])
+        before_cache = len(local_files)
+        local_files = [
+            f for f in local_files
+            if (str(f), f.stat().st_size) not in cached
+        ]
+        job["cached_skipped"] = before_cache - len(local_files)
+
+        # ── Phase 3: fast EXIF date filter (parallel, no thumbnail work) ─────
         if start_date or end_date:
             job["status"] = "date_checking"
             job["total"] = len(local_files)
@@ -121,7 +160,7 @@ async def _run_scan(
         else:
             candidates = local_files
 
-        # ── Phase 3: read filtered photos (thumbnail + base64) ───────────────
+        # ── Phase 4: read filtered photos (thumbnail only, parallel) ─────────
         job["status"] = "scanning"
         job["total"] = len(candidates)
         job["scanned"] = 0
@@ -132,27 +171,50 @@ async def _run_scan(
             job["total"] = total
             job["current_file"] = filename
 
-        photos = await scan_files(candidates, progress_callback=on_scan_progress)
+        photos = await scan_files(
+            candidates,
+            progress_callback=on_scan_progress,
+            include_full=False,   # lazy — only for photos that reach detection
+        )
+        # Drop any that errored (couldn't be read)
+        photos = [p for p in photos if not p.error]
         photos = sort_by_timestamp(photos)
 
-        # ── Phase 4: prefilter — cheap "does this contain a child?" check ────
+        # ── Phase 5: local face detection (free) ─────────────────────────────
+        if photos:
+            job["status"] = "face_check"
+            job["face_total"] = len(photos)
+            job["face_passed"] = 0
+            job["scanned"] = 0
+            job["total"] = len(photos)
+
+            def on_face_progress(current, total, filename, passed):
+                job["scanned"] = current
+                job["total"] = total
+                job["current_file"] = filename
+                job["face_passed"] = passed
+
+            photos = await face_filter_batch(photos, progress_callback=on_face_progress)
+
+        # ── Phase 6: Haiku prefilter — "does this contain a child?" ──────────
         if use_prefilter and photos:
             job["status"] = "prefiltering"
             job["prefilter_total"] = len(photos)
             job["prefilter_checked"] = 0
             job["prefilter_passed"] = 0
-            passed = []
-            for i, photo in enumerate(photos):
-                job["prefilter_checked"] = i + 1
-                job["current_file"] = photo.filename
-                has_child = await asyncio.to_thread(prefilter_has_child, photo, model)
-                if has_child:
-                    passed.append(photo)
-                    job["prefilter_passed"] = len(passed)
-            job["total"] = len(passed)
-            photos = passed
 
-        # ── Phase 5: detect milestones ───────────────────────────────────────
+            def on_prefilter_progress(current, total, filename, passed):
+                job["prefilter_checked"] = current
+                job["current_file"] = filename
+                job["prefilter_passed"] = passed
+
+            photos = await prefilter_batch(
+                photos, model=model,
+                progress_callback=on_prefilter_progress,
+            )
+            job["total"] = len(photos)
+
+        # ── Phase 7: detect milestones (parallel, lazy full_b64 hydration) ───
         job["status"] = "detecting"
         job["detected"] = 0
         job["total"] = len(photos)
@@ -167,6 +229,7 @@ async def _run_scan(
             model=model,
             min_confidence=min_confidence,
             progress_callback=on_detect_progress,
+            hydrate=True,
         )
 
         # ── Phase 6: persist ─────────────────────────────────────────────────
@@ -338,8 +401,8 @@ async def upload_photo(
     with open(dest_path, "wb") as f:
         f.write(content)
 
-    # Scan & detect
-    scan_result = await asyncio.to_thread(scan_photo, dest_path)
+    # Scan & detect — include_full=True since we're sending to Claude immediately
+    scan_result = await asyncio.to_thread(scan_photo, dest_path, True)
     if scan_result.error:
         raise HTTPException(status_code=422, detail=f"Could not read image: {scan_result.error}")
 

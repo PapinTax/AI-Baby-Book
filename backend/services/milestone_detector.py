@@ -7,6 +7,7 @@ Design decisions:
 - Batches photos but keeps prompts short to stay within token budget
 - Returns structured JSON so parsing is deterministic
 """
+import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -14,12 +15,15 @@ from typing import Optional
 
 import anthropic
 
-from services.photo_scanner import PhotoScanResult
+from services.photo_scanner import PhotoScanResult, hydrate_full_b64
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ACCURACY_MODEL = "claude-sonnet-4-6"
+
+# Concurrent Claude API calls. Anthropic rate-limits per-tier; 8 is safe.
+API_CONCURRENCY = int(os.getenv("API_CONCURRENCY", "8"))
 
 MILESTONE_TAXONOMY = {
     "first_smile": "Baby smiling — earliest captured smile",
@@ -231,23 +235,66 @@ def detect_milestone(photo: PhotoScanResult, model: str = DEFAULT_MODEL) -> Mile
         )
 
 
+async def prefilter_batch(
+    photos: list[PhotoScanResult],
+    model: str = DEFAULT_MODEL,
+    progress_callback=None,
+    concurrency: int = API_CONCURRENCY,
+) -> list[PhotoScanResult]:
+    """
+    Parallel Haiku prefilter. Returns only photos that contain a child.
+    Preserves input ordering.
+    """
+    total = len(photos)
+    sem = asyncio.Semaphore(concurrency)
+    passed_count = 0
+    done = 0
+
+    async def check(p: PhotoScanResult) -> tuple[PhotoScanResult, bool]:
+        nonlocal done, passed_count
+        async with sem:
+            ok = await asyncio.to_thread(prefilter_has_child, p, model)
+        done += 1
+        if ok:
+            passed_count += 1
+        if progress_callback:
+            progress_callback(done, total, p.filename, passed_count)
+        return p, ok
+
+    results = await asyncio.gather(*(check(p) for p in photos))
+    return [p for p, ok in results if ok]
+
+
 async def detect_milestones_batch(
     photos: list[PhotoScanResult],
     model: str = DEFAULT_MODEL,
     min_confidence: float = 0.5,
     progress_callback=None,
+    concurrency: int = API_CONCURRENCY,
+    hydrate: bool = True,
 ) -> list[MilestoneDetection]:
     """
-    Detect milestones across a list of photos.
+    Parallel milestone detection. When hydrate=True, calls hydrate_full_b64
+    on each photo before sending — lets the caller skip generating full_b64
+    until the final detection pass.
     Only returns detections above min_confidence threshold.
-    progress_callback(current, total, filename) called per photo.
     """
-    import asyncio
-    results = []
-    for i, photo in enumerate(photos):
+    total = len(photos)
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def one(p: PhotoScanResult) -> Optional[MilestoneDetection]:
+        nonlocal done
+        async with sem:
+            if hydrate:
+                await asyncio.to_thread(hydrate_full_b64, p)
+            det = await asyncio.to_thread(detect_milestone, p, model)
+        done += 1
         if progress_callback:
-            progress_callback(i + 1, len(photos), photo.filename)
-        detection = await asyncio.to_thread(detect_milestone, photo, model)
-        if detection.has_milestone and detection.confidence >= min_confidence:
-            results.append(detection)
-    return results
+            progress_callback(done, total, p.filename)
+        if det.has_milestone and det.confidence >= min_confidence:
+            return det
+        return None
+
+    out = await asyncio.gather(*(one(p) for p in photos))
+    return [d for d in out if d is not None]

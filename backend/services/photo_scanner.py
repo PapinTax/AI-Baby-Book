@@ -26,6 +26,10 @@ SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".ti
 THUMBNAIL_SIZE = (400, 400)
 MAX_CLAUDE_IMAGE_SIZE = (1024, 1024)
 
+# Concurrency for local I/O+CPU work (EXIF reads, thumbnail gen, face detection).
+# Tunable via env for users on low-RAM machines.
+SCAN_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "8"))
+
 
 # ── PowerShell Shell property reader (Windows / iCloud) ───────────────────────
 
@@ -162,8 +166,13 @@ def save_thumbnail_to_disk(result: "PhotoScanResult", thumbnails_dir: str) -> Op
     return filename
 
 
-def scan_photo(file_path: str) -> PhotoScanResult:
-    """Synchronous scan of a single photo. Call via asyncio.to_thread for async."""
+def scan_photo(file_path: str, include_full: bool = False) -> PhotoScanResult:
+    """
+    Synchronous scan of a single photo. Always generates the 400px thumbnail.
+    Only generates the 1024px full_b64 when include_full=True — defer that
+    for photos that will actually be sent to Claude for detection.
+    Call via asyncio.to_thread for async.
+    """
     path = Path(file_path)
     result = PhotoScanResult(
         file_path=file_path,
@@ -182,10 +191,28 @@ def scan_photo(file_path: str) -> PhotoScanResult:
             result.taken_at = _extract_taken_at(img)
             result.width, result.height = img.size
             result.thumbnail_b64 = _image_to_b64(img, THUMBNAIL_SIZE)
-            result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
+            if include_full:
+                result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
     except Exception as e:
         result.error = str(e)
 
+    return result
+
+
+def hydrate_full_b64(result: PhotoScanResult) -> PhotoScanResult:
+    """
+    Re-open the source file and populate full_b64 on an existing scan result.
+    Used to defer the expensive 1024px encode until after prefiltering, so we
+    only pay that cost for photos that will actually be sent to Claude.
+    No-op if full_b64 is already present or the source file is gone.
+    """
+    if result.full_b64 or result.error:
+        return result
+    try:
+        with Image.open(result.file_path) as img:
+            result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
+    except Exception as e:
+        result.error = str(e)
     return result
 
 
@@ -259,40 +286,55 @@ async def filter_files_by_exif_date(
     start_date: Optional[datetime.date],
     end_date: Optional[datetime.date],
     progress_callback=None,
+    concurrency: int = SCAN_CONCURRENCY,
 ) -> list[Path]:
     """
-    Fast EXIF-date-only pass. Files with unreadable dates are kept (fail-open).
-    progress_callback(current, total, filename) — no phase; caller owns status.
+    Parallel EXIF-date-only pass. Files with unreadable dates are kept (fail-open).
+    Uses asyncio.gather + semaphore; preserves input ordering in the output.
     """
     if not (start_date or end_date):
         return files
-    candidates: list[Path] = []
     total = len(files)
-    for i, f in enumerate(files):
-        if progress_callback and (i % 50 == 0 or i == total - 1):
-            progress_callback(i + 1, total, f.name)
-        d = await asyncio.to_thread(_read_exif_date_only, f)
-        if _date_in_range(d, start_date, end_date):
-            candidates.append(f)
-    return candidates
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def check(f: Path) -> tuple[Path, bool]:
+        nonlocal done
+        async with sem:
+            d = await asyncio.to_thread(_read_exif_date_only, f)
+        done += 1
+        if progress_callback and (done % 25 == 0 or done == total):
+            progress_callback(done, total, f.name)
+        return f, _date_in_range(d, start_date, end_date)
+
+    results = await asyncio.gather(*(check(f) for f in files))
+    return [f for f, ok in results if ok]
 
 
 async def scan_files(
     files: list[Path],
     progress_callback=None,
+    include_full: bool = False,
+    concurrency: int = SCAN_CONCURRENCY,
 ) -> list[PhotoScanResult]:
     """
-    Run full scan (thumbnail + base64) on each file.
-    progress_callback(current, total, filename) — no phase; caller owns status.
+    Parallel scan (thumbnail + optional full_b64) on each file.
+    Output preserves input ordering so downstream sort stays stable.
     """
-    results: list[PhotoScanResult] = []
     total = len(files)
-    for i, file_path in enumerate(files):
-        if progress_callback:
-            progress_callback(i + 1, total, file_path.name)
-        result = await asyncio.to_thread(scan_photo, str(file_path))
-        results.append(result)
-    return results
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def one(f: Path) -> PhotoScanResult:
+        nonlocal done
+        async with sem:
+            r = await asyncio.to_thread(scan_photo, str(f), include_full)
+        done += 1
+        if progress_callback and (done % 5 == 0 or done == total):
+            progress_callback(done, total, f.name)
+        return r
+
+    return list(await asyncio.gather(*(one(f) for f in files)))
 
 
 # Legacy combined entry — kept for any callers still using it.

@@ -13,7 +13,7 @@ const DEFAULT_START = "2024-01-30";
 const DEFAULT_END = new Date().toISOString().slice(0, 10);
 
 type ScanPhase =
-  | "idle" | "listing" | "date_checking" | "scanning"
+  | "idle" | "listing" | "date_checking" | "scanning" | "face_check"
   | "prefiltering" | "detecting" | "saving" | "complete" | "error";
 type JobStatus = ScanJobState & { status: ScanPhase };
 
@@ -55,10 +55,11 @@ function DirectoryScanTab() {
   const phaseLabel: Record<string, string> = {
     idle: "",
     listing: "Finding photos...",
-    date_checking: "Step 1/4 — Checking photo dates (no AI yet)...",
-    scanning: "Step 2/4 — Reading filtered photos...",
-    prefiltering: "Step 3/4 — Pre-filtering: checking for children...",
-    detecting: "Step 4/4 — Detecting milestones with Claude Vision...",
+    date_checking: "Step 1/5 — Checking photo dates (no AI yet)...",
+    scanning: "Step 2/5 — Reading filtered photos...",
+    face_check: "Step 3/5 — Detecting faces locally (free)...",
+    prefiltering: "Step 4/5 — Pre-filtering: checking for children...",
+    detecting: "Step 5/5 — Detecting milestones with Claude Vision...",
     saving: "Saving results...",
     complete: "Scan complete!",
     error: "Scan failed",
@@ -197,16 +198,28 @@ function DirectoryScanTab() {
           )}
 
           {/* Filtering summary chips */}
-          {((job.cloud_skipped ?? 0) > 0 || (job.date_filtered ?? 0) > 0 || job.prefilter_passed != null) && (
+          {((job.cloud_skipped ?? 0) > 0 || (job.cached_skipped ?? 0) > 0 ||
+            (job.date_filtered ?? 0) > 0 || (job.face_total ?? 0) > 0 ||
+            job.prefilter_passed != null) && (
             <div className="flex flex-wrap gap-2">
               {(job.cloud_skipped ?? 0) > 0 && (
                 <span className="text-xs bg-gray-100 text-gray-600 border border-gray-200 px-2 py-0.5 rounded-full">
                   {job.cloud_skipped?.toLocaleString()} not downloaded (iCloud) — skipped
                 </span>
               )}
+              {(job.cached_skipped ?? 0) > 0 && (
+                <span className="text-xs bg-green-50 text-green-700 border border-green-100 px-2 py-0.5 rounded-full">
+                  {job.cached_skipped?.toLocaleString()} already scanned — cached
+                </span>
+              )}
               {(job.date_filtered ?? 0) > 0 && (
                 <span className="text-xs bg-blue-50 text-blue-700 border border-blue-100 px-2 py-0.5 rounded-full">
                   {job.date_filtered} skipped by date
+                </span>
+              )}
+              {(job.face_total ?? 0) > 0 && (
+                <span className="text-xs bg-amber-50 text-amber-700 border border-amber-100 px-2 py-0.5 rounded-full">
+                  {job.face_passed ?? 0} / {job.face_total} had faces
                 </span>
               )}
               {job.prefilter_passed != null && job.prefilter_total != null && (
