@@ -73,6 +73,7 @@ export type ScanJobState = {
   cached_skipped?: number;
   face_total?: number;
   face_passed?: number;
+  burst_collapsed?: number;
   error?: string;
 };
 
@@ -106,8 +107,34 @@ export function openScanStream(
   return () => es.close();
 }
 
-export function listPhotos() {
-  return request<Photo[]>("/photos");
+export function listPhotos(params?: {
+  startDate?: string;
+  endDate?: string;
+  hasMilestones?: boolean;
+  noDate?: boolean;
+  limit?: number;
+  offset?: number;
+}) {
+  const q = new URLSearchParams();
+  if (params?.startDate) q.set("start_date", params.startDate);
+  if (params?.endDate) q.set("end_date", params.endDate);
+  if (params?.hasMilestones !== undefined) q.set("has_milestones", String(params.hasMilestones));
+  if (params?.noDate) q.set("no_date", "true");
+  if (params?.limit !== undefined) q.set("limit", String(params.limit));
+  if (params?.offset !== undefined) q.set("offset", String(params.offset));
+  const qs = q.toString();
+  return request<Photo[]>(`/photos${qs ? `?${qs}` : ""}`);
+}
+
+export function deletePhoto(id: number) {
+  return fetch(`${BASE}/photos/${id}`, { method: "DELETE" });
+}
+
+export function updatePhotoDate(id: number, takenAt: string | null) {
+  return request<Photo>(`/photos/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ taken_at: takenAt }),
+  });
 }
 
 // --- Milestones ---

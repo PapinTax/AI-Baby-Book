@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,76 +23,89 @@ try:
 except ImportError:
     pass
 
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
-IMAGE_EXTENSIONS = SUPPORTED_EXTENSIONS
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif", ".webp"}
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".m4v", ".avi", ".mkv", ".3gp"}
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 THUMBNAIL_SIZE = (400, 400)
 MAX_CLAUDE_IMAGE_SIZE = (1024, 1024)
 
-# Concurrency for local I/O+CPU work (EXIF reads, thumbnail gen, face detection).
-# Tunable via env for users on low-RAM machines.
+# Tunable concurrency — lower on low-RAM machines via env
 SCAN_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "8"))
 
 
-# ── PowerShell Shell property reader (Windows / iCloud) ───────────────────────
+# ── Windows Shell property reader (targeted file list) ───────────────────────
+# Reads System.Photo.DateTaken via the Windows Shell API for a specific list
+# of paths (written to a temp file to avoid command-line length limits).
+# iCloud populates this from its local index — no file download triggered.
 
 _PS_DATE_SCRIPT = r"""
-$dir = $env:SCAN_DIR
+$pathsFile = $env:PATHS_FILE
+$paths = Get-Content -Path $pathsFile -Encoding UTF8
 $shell = New-Object -ComObject Shell.Application
 $nsCache = @{}
 $out = [System.Collections.Generic.List[object]]::new()
-Get-ChildItem $dir -Recurse -File | Where-Object {
-    $_.Extension -match '(?i)\.(heic|heif|jpg|jpeg|png|tiff|tif|webp)$'
-} | ForEach-Object {
-    $d = $_.DirectoryName
-    if (-not $nsCache.ContainsKey($d)) { $nsCache[$d] = $shell.NameSpace($d) }
-    $ns = $nsCache[$d]
-    $item = if ($ns) { $ns.ParseName($_.Name) } else { $null }
+foreach ($p in $paths) {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    $dir = [System.IO.Path]::GetDirectoryName($p)
+    $fname = [System.IO.Path]::GetFileName($p)
+    if (-not $nsCache.ContainsKey($dir)) { $nsCache[$dir] = $shell.NameSpace($dir) }
+    $ns = $nsCache[$dir]
+    $item = if ($ns) { $ns.ParseName($fname) } else { $null }
     $dt = if ($item) { $item.ExtendedProperty('System.Photo.DateTaken') } else { $null }
     $out.Add([PSCustomObject]@{
-        p = $_.FullName
-        d = if ($dt) { $dt.ToString('yyyy-MM-dd') } else { '' }
+        p = $p
+        d = if ($dt) { $dt.ToString('yyyy-MM-ddTHH:mm:ss') } else { '' }
     })
 }
-$out | ConvertTo-Json -Compress -Depth 1
+if ($out.Count -eq 0) { '[]' } else { $out | ConvertTo-Json -Compress -Depth 1 }
 """
 
 
-def _get_dates_via_shell_sync(directory: str) -> Optional[dict[str, Optional[datetime.date]]]:
+def _get_dates_for_paths(paths: list[Path]) -> dict[str, Optional[datetime.datetime]]:
     """
-    Windows-only: read System.Photo.DateTaken from the Shell property store.
-    iCloud populates this from its local index — no file download triggered.
-    Returns None if not on Windows or if PowerShell fails.
+    Windows-only: read System.Photo.DateTaken for a specific list of image paths.
+    Returns {str(path).lower(): datetime or None}. Returns {} on failure or non-Windows.
     """
-    if platform.system() != "Windows":
-        return None
+    if platform.system() != "Windows" or not paths:
+        return {}
     try:
-        env = os.environ.copy()
-        env["SCAN_DIR"] = directory
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_DATE_SCRIPT],
-            capture_output=True, text=True, timeout=300, env=env,
-        )
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return None
-        raw = json.loads(proc.stdout)
-        if isinstance(raw, dict):
-            raw = [raw]
-        result: dict[str, Optional[datetime.date]] = {}
-        for item in raw:
-            path = item.get("p", "").lower()
-            date_str = item.get("d", "")
-            if path:
-                result[path] = (
-                    datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-                    if date_str else None
-                )
-        return result
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
+            f.write("\n".join(str(p) for p in paths))
+            tmp_path = f.name
+        try:
+            env = os.environ.copy()
+            env["PATHS_FILE"] = tmp_path
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_DATE_SCRIPT],
+                capture_output=True, text=True, timeout=300, env=env,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return {}
+            raw = json.loads(proc.stdout)
+            if isinstance(raw, dict):
+                raw = [raw]
+            result: dict[str, Optional[datetime.datetime]] = {}
+            for item in raw:
+                path_str = item.get("p", "")
+                date_str = item.get("d", "")
+                if path_str:
+                    result[path_str.lower()] = (
+                        datetime.datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+                        if date_str else None
+                    )
+            return result
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     except Exception:
-        return None
+        return {}
 
 
+# ── PhotoScanResult ───────────────────────────────────────────────────────────
 
 @dataclass
 class PhotoScanResult:
@@ -101,14 +115,15 @@ class PhotoScanResult:
     file_size: int
     width: Optional[int]
     height: Optional[int]
-    thumbnail_b64: Optional[str]           # base64 JPEG for API calls
-    full_b64: Optional[str]                # base64 JPEG resized for Claude
+    thumbnail_b64: Optional[str]        # base64 JPEG for API calls
+    full_b64: Optional[str]             # base64 JPEG resized for Claude
     media_type: str = "image/jpeg"
     error: Optional[str] = None
 
 
+# ── EXIF / image helpers ──────────────────────────────────────────────────────
+
 def _parse_exif_datetime(raw: str) -> Optional[datetime.datetime]:
-    """Parse EXIF datetime string '2023:06:15 14:30:00'."""
     try:
         return datetime.datetime.strptime(raw.strip(), "%Y:%m:%d %H:%M:%S")
     except (ValueError, AttributeError):
@@ -133,8 +148,16 @@ def _extract_taken_at(img: Image.Image) -> Optional[datetime.datetime]:
     return None
 
 
+def _read_exif_datetime(file_path: Path) -> Optional[datetime.datetime]:
+    """Open an image and return its EXIF datetime. Lighter than a full scan."""
+    try:
+        with Image.open(file_path) as img:
+            return _extract_taken_at(img)
+    except Exception:
+        return None
+
+
 def _image_to_bytes(img: Image.Image, max_size: tuple[int, int], quality: int = 85) -> bytes:
-    """Resize image and return JPEG bytes."""
     img = img.copy()
     img.thumbnail(max_size, Image.LANCZOS)
     if img.mode in ("RGBA", "P", "LA"):
@@ -145,7 +168,6 @@ def _image_to_bytes(img: Image.Image, max_size: tuple[int, int], quality: int = 
 
 
 def _image_to_b64(img: Image.Image, max_size: tuple[int, int]) -> str:
-    """Resize image, convert to JPEG base64."""
     return base64.b64encode(_image_to_bytes(img, max_size)).decode()
 
 
@@ -155,11 +177,7 @@ def _thumbnail_filename(file_path: str) -> str:
 
 
 def save_thumbnail_to_disk(result: "PhotoScanResult", thumbnails_dir: str) -> Optional[str]:
-    """
-    Write the thumbnail bytes for a scan result to disk.
-    Returns the filename (not full path) or None on failure.
-    Idempotent — skips write if file already exists.
-    """
+    """Write thumbnail bytes to disk. Idempotent — skips if already exists."""
     if not result.thumbnail_b64:
         return None
     filename = _thumbnail_filename(result.file_path)
@@ -169,12 +187,17 @@ def save_thumbnail_to_disk(result: "PhotoScanResult", thumbnails_dir: str) -> Op
     return filename
 
 
-def scan_photo(file_path: str, include_full: bool = False) -> PhotoScanResult:
+# ── Image scanning ────────────────────────────────────────────────────────────
+
+def scan_photo(
+    file_path: str,
+    include_full: bool = False,
+    pre_read_date: Optional[datetime.datetime] = None,
+) -> PhotoScanResult:
     """
-    Synchronous scan of a single photo. Always generates the 400px thumbnail.
-    Only generates the 1024px full_b64 when include_full=True — defer that
-    for photos that will actually be sent to Claude for detection.
-    Call via asyncio.to_thread for async.
+    Scan a single image. Always generates the 400px thumbnail.
+    pre_read_date: if provided (from bulk Shell/EXIF pre-read), used directly —
+    skips redundant in-file EXIF parsing. Falls back: EXIF → file mtime.
     """
     path = Path(file_path)
     result = PhotoScanResult(
@@ -187,33 +210,30 @@ def scan_photo(file_path: str, include_full: bool = False) -> PhotoScanResult:
         thumbnail_b64=None,
         full_b64=None,
     )
-
     try:
         result.file_size = path.stat().st_size
         with Image.open(file_path) as img:
-            result.taken_at = _extract_taken_at(img)
+            if pre_read_date is not None:
+                result.taken_at = pre_read_date
+            else:
+                result.taken_at = _extract_taken_at(img)  # None if no EXIF — no mtime fallback
             result.width, result.height = img.size
             result.thumbnail_b64 = _image_to_b64(img, THUMBNAIL_SIZE)
             if include_full:
                 result.full_b64 = _image_to_b64(img, MAX_CLAUDE_IMAGE_SIZE)
     except Exception as e:
         result.error = str(e)
-
     return result
 
 
 def hydrate_full_b64(result: PhotoScanResult) -> PhotoScanResult:
-    """
-    Populate full_b64 on an existing scan result that was scanned without it.
-    Dispatches to video or image path automatically. No-op if already hydrated.
-    """
+    """Populate full_b64 on a scan result that was scanned without it. No-op if already set."""
     if result.full_b64 or result.error:
         return result
     ext = Path(result.file_path).suffix.lower()
     if ext in VIDEO_EXTENSIONS:
         try:
             import cv2
-            import numpy as np
             cap = cv2.VideoCapture(result.file_path)
             try:
                 frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -236,11 +256,10 @@ def hydrate_full_b64(result: PhotoScanResult) -> PhotoScanResult:
     return result
 
 
+# ── Video scanning ────────────────────────────────────────────────────────────
+
 def _extract_video_date(path: Path) -> Optional[datetime.datetime]:
-    """
-    Try ffprobe for the QuickTime/MP4 creation_time tag, then fall back to
-    the file's mtime. ffprobe is optional — if absent, mtime is used silently.
-    """
+    """Try ffprobe for QuickTime creation_time, then fall back to file mtime."""
     try:
         proc = subprocess.run(
             [
@@ -267,10 +286,7 @@ def _extract_video_date(path: Path) -> Optional[datetime.datetime]:
 
 
 def _best_video_frame(file_path: str) -> Optional[Image.Image]:
-    """
-    Open a video and return the sharpest frame from 5 evenly-spaced samples.
-    Returns None if the file cannot be read.
-    """
+    """Return the sharpest frame from 5 evenly-spaced samples via Laplacian variance."""
     try:
         import cv2
         import numpy as np
@@ -303,11 +319,12 @@ def _best_video_frame(file_path: str) -> Optional[Image.Image]:
         return None
 
 
-def scan_video(file_path: str, include_full: bool = False) -> PhotoScanResult:
-    """
-    Extract the sharpest frame from a video and return it as a PhotoScanResult.
-    Date comes from QuickTime/MP4 metadata (via ffprobe) or file mtime.
-    """
+def scan_video(
+    file_path: str,
+    include_full: bool = False,
+    pre_read_date: Optional[datetime.datetime] = None,
+) -> PhotoScanResult:
+    """Extract the sharpest frame from a video and return as a PhotoScanResult."""
     path = Path(file_path)
     result = PhotoScanResult(
         file_path=file_path,
@@ -321,7 +338,7 @@ def scan_video(file_path: str, include_full: bool = False) -> PhotoScanResult:
     )
     try:
         result.file_size = path.stat().st_size
-        result.taken_at = _extract_video_date(path)
+        result.taken_at = pre_read_date if pre_read_date is not None else _extract_video_date(path)
         img = _best_video_frame(file_path)
         if img is None:
             result.error = "Could not extract frame from video"
@@ -335,18 +352,23 @@ def scan_video(file_path: str, include_full: bool = False) -> PhotoScanResult:
     return result
 
 
-def scan_file(file_path: str, include_full: bool = False) -> PhotoScanResult:
+def scan_file(
+    file_path: str,
+    include_full: bool = False,
+    pre_read_date: Optional[datetime.datetime] = None,
+) -> PhotoScanResult:
     """Dispatch to scan_video or scan_photo based on file extension."""
     if Path(file_path).suffix.lower() in VIDEO_EXTENSIONS:
-        return scan_video(file_path, include_full=include_full)
-    return scan_photo(file_path, include_full=include_full)
+        return scan_video(file_path, include_full=include_full, pre_read_date=pre_read_date)
+    return scan_photo(file_path, include_full=include_full, pre_read_date=pre_read_date)
 
+
+# ── iCloud placeholder detection ──────────────────────────────────────────────
 
 def _is_cloud_placeholder(path: Path) -> bool:
     """
-    Windows-only: returns True if the file is an iCloud placeholder
-    (not yet downloaded). Checks FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS.
-    Instant — no file open, no download triggered.
+    Windows-only: True if file is an iCloud placeholder not yet downloaded.
+    Checks FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN. Instant.
     """
     if platform.system() != "Windows":
         return False
@@ -362,24 +384,148 @@ def _is_cloud_placeholder(path: Path) -> bool:
         return False
 
 
+def list_photo_files(directory: str) -> tuple[list[Path], int]:
+    """
+    Enumerate supported files under directory, excluding iCloud placeholders.
+    Returns (local_files, skipped_cloud_count). Sorted by mtime oldest-first.
+    """
+    dir_path = Path(directory)
+    if not dir_path.is_dir():
+        raise ValueError(f"Not a directory: {directory}")
+    all_files = [
+        f for f in dir_path.rglob("*")
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    all_files.sort(key=lambda f: f.stat().st_mtime)
+    local_files = [f for f in all_files if not _is_cloud_placeholder(f)]
+    skipped_cloud = len(all_files) - len(local_files)
+    return local_files, skipped_cloud
 
-def _read_exif_date_only(file_path: Path) -> Optional[datetime.date]:
-    """Read EXIF date from an image without generating a thumbnail."""
-    try:
-        with Image.open(file_path) as img:
-            dt = _extract_taken_at(img)
-            return dt.date() if dt else None
-    except Exception:
-        return None
+
+# ── Bulk date reading ─────────────────────────────────────────────────────────
+
+async def read_dates_bulk(
+    files: list[Path],
+    concurrency: int = SCAN_CONCURRENCY,
+) -> dict[str, Optional[datetime.datetime]]:
+    """
+    Read taken_at datetime for all files. Primary source on Windows is the Shell
+    property store (single PS call, no file opens, works for iCloud-indexed HEIC).
+    Falls back to EXIF then file mtime — Photo.taken_at should never be NULL
+    for a file that exists locally.
+
+    Returns {str(path).lower(): datetime or None}.
+    """
+    result: dict[str, Optional[datetime.datetime]] = {}
+
+    image_files = [f for f in files if f.suffix.lower() in IMAGE_EXTENSIONS]
+    video_files = [f for f in files if f.suffix.lower() in VIDEO_EXTENSIONS]
+
+    # Windows primary: one Shell property-store call for all image paths
+    if platform.system() == "Windows" and image_files:
+        shell_dates = await asyncio.to_thread(_get_dates_for_paths, image_files)
+        result.update(shell_dates)
+
+    # Parallel EXIF + mtime fallback for images Shell didn't cover
+    missing_images = [f for f in image_files if str(f).lower() not in result]
+    if missing_images:
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _exif_one(f: Path) -> None:
+            async with sem:
+                dt = await asyncio.to_thread(_read_exif_datetime, f)
+            result[str(f).lower()] = dt  # None if EXIF unreadable — no mtime fallback
+
+        await asyncio.gather(*(_exif_one(f) for f in missing_images))
+
+    # Videos: ffprobe / mtime
+    if video_files:
+        async def _video_date(f: Path) -> None:
+            dt = await asyncio.to_thread(_extract_video_date, f)
+            result[str(f).lower()] = dt
+
+        await asyncio.gather(*(_video_date(f) for f in video_files))
+
+    # Guarantee every file has an entry
+    for f in files:
+        result.setdefault(str(f).lower(), None)
+
+    return result
 
 
-def _read_date_only(file_path: Path) -> Optional[datetime.date]:
-    """Date-only read for any supported file type (image or video)."""
-    if file_path.suffix.lower() in VIDEO_EXTENSIONS:
-        dt = _extract_video_date(file_path)
-        return dt.date() if dt else None
-    return _read_exif_date_only(file_path)
+# ── Burst clustering ──────────────────────────────────────────────────────────
 
+def cluster_bursts(
+    files: list[Path],
+    dates: dict[str, Optional[datetime.datetime]],
+    window_seconds: int = 60,
+) -> list[Path]:
+    """
+    Group files taken within window_seconds of each other into burst clusters.
+    Returns one representative per cluster — the largest file by byte size,
+    a free proxy for image quality that requires no file opens.
+    Files without a timestamp each form their own single-file cluster.
+    Input should be sorted chronologically (oldest first).
+    """
+    if not files:
+        return files
+
+    clusters: list[list[Path]] = []
+    current: list[Path] = []
+    anchor: Optional[datetime.datetime] = None
+
+    for f in files:
+        dt = dates.get(str(f).lower())
+        if dt is None or anchor is None:
+            if current:
+                clusters.append(current)
+            current = [f]
+            anchor = dt
+        elif abs((dt - anchor).total_seconds()) <= window_seconds:
+            current.append(f)
+        else:
+            clusters.append(current)
+            current = [f]
+            anchor = dt
+
+    if current:
+        clusters.append(current)
+
+    return [max(cluster, key=lambda p: p.stat().st_size) for cluster in clusters]
+
+
+# ── Parallel scan ─────────────────────────────────────────────────────────────
+
+async def scan_files(
+    files: list[Path],
+    dates: Optional[dict[str, Optional[datetime.datetime]]] = None,
+    progress_callback=None,
+    include_full: bool = False,
+    concurrency: int = SCAN_CONCURRENCY,
+) -> list[PhotoScanResult]:
+    """
+    Parallel scan (thumbnail + optional full_b64) on each file.
+    Pass dates to skip redundant in-file EXIF parsing for pre-read dates.
+    Output preserves input ordering.
+    """
+    total = len(files)
+    sem = asyncio.Semaphore(concurrency)
+    done = 0
+
+    async def one(f: Path) -> PhotoScanResult:
+        nonlocal done
+        pre_date = dates.get(str(f).lower()) if dates else None
+        async with sem:
+            r = await asyncio.to_thread(scan_file, str(f), include_full, pre_date)
+        done += 1
+        if progress_callback and (done % 5 == 0 or done == total):
+            progress_callback(done, total, f.name)
+        return r
+
+    return list(await asyncio.gather(*(one(f) for f in files)))
+
+
+# ── Date range helper ─────────────────────────────────────────────────────────
 
 def _date_in_range(
     d: Optional[datetime.date],
@@ -387,7 +533,7 @@ def _date_in_range(
     end_date: Optional[datetime.date],
 ) -> bool:
     if d is None:
-        return True  # no date → include (fail-open)
+        return True  # fail-open: include files whose date is unreadable
     if start_date and d < start_date:
         return False
     if end_date and d > end_date:
@@ -395,25 +541,7 @@ def _date_in_range(
     return True
 
 
-def list_photo_files(directory: str) -> tuple[list[Path], int]:
-    """
-    Enumerate supported image files under `directory`, excluding iCloud placeholders.
-    Returns (local_files, skipped_cloud_count).
-    """
-    dir_path = Path(directory)
-    if not dir_path.is_dir():
-        raise ValueError(f"Not a directory: {directory}")
-
-    all_files = [
-        f for f in dir_path.rglob("*")
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
-    all_files.sort(key=lambda f: f.stat().st_mtime)
-
-    local_files = [f for f in all_files if not _is_cloud_placeholder(f)]
-    skipped_cloud = len(all_files) - len(local_files)
-    return local_files, skipped_cloud
-
+# ── Legacy entry points ───────────────────────────────────────────────────────
 
 async def filter_files_by_exif_date(
     files: list[Path],
@@ -422,15 +550,19 @@ async def filter_files_by_exif_date(
     progress_callback=None,
     concurrency: int = SCAN_CONCURRENCY,
 ) -> list[Path]:
-    """
-    Parallel EXIF-date-only pass. Files with unreadable dates are kept (fail-open).
-    Uses asyncio.gather + semaphore; preserves input ordering in the output.
-    """
+    """Legacy EXIF-date filter. New code should use read_dates_bulk + inline filter."""
     if not (start_date or end_date):
         return files
     total = len(files)
     sem = asyncio.Semaphore(concurrency)
     done = 0
+
+    def _read_date_only(file_path: Path) -> Optional[datetime.date]:
+        if file_path.suffix.lower() in VIDEO_EXTENSIONS:
+            dt = _extract_video_date(file_path)
+            return dt.date() if dt else None
+        dt = _read_exif_datetime(file_path)
+        return dt.date() if dt else None
 
     async def check(f: Path) -> tuple[Path, bool]:
         nonlocal done
@@ -445,39 +577,13 @@ async def filter_files_by_exif_date(
     return [f for f, ok in results if ok]
 
 
-async def scan_files(
-    files: list[Path],
-    progress_callback=None,
-    include_full: bool = False,
-    concurrency: int = SCAN_CONCURRENCY,
-) -> list[PhotoScanResult]:
-    """
-    Parallel scan (thumbnail + optional full_b64) on each file.
-    Output preserves input ordering so downstream sort stays stable.
-    """
-    total = len(files)
-    sem = asyncio.Semaphore(concurrency)
-    done = 0
-
-    async def one(f: Path) -> PhotoScanResult:
-        nonlocal done
-        async with sem:
-            r = await asyncio.to_thread(scan_file, str(f), include_full)
-        done += 1
-        if progress_callback and (done % 5 == 0 or done == total):
-            progress_callback(done, total, f.name)
-        return r
-
-    return list(await asyncio.gather(*(one(f) for f in files)))
-
-
-# Legacy combined entry — kept for any callers still using it.
 async def scan_directory(
     directory: str,
     progress_callback=None,
     start_date: Optional[datetime.date] = None,
     end_date: Optional[datetime.date] = None,
 ) -> tuple[list[PhotoScanResult], int]:
+    """Legacy combined entry — kept for any callers still using it."""
     local_files, skipped_cloud = list_photo_files(directory)
     candidates = await filter_files_by_exif_date(
         local_files, start_date, end_date,
@@ -498,6 +604,4 @@ async def scan_directory(
 
 def sort_by_timestamp(results: list[PhotoScanResult]) -> list[PhotoScanResult]:
     """Sort photos oldest-first, pushing photos with no timestamp to the end."""
-    def sort_key(r: PhotoScanResult):
-        return r.taken_at or datetime.datetime(9999, 1, 1)
-    return sorted(results, key=sort_key)
+    return sorted(results, key=lambda r: r.taken_at or datetime.datetime(9999, 1, 1))

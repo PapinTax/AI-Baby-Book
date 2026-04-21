@@ -85,7 +85,7 @@ def _compute_age(birth_date: datetime.date, taken_at: datetime.datetime) -> Opti
 
 
 @router.get("/pending", response_model=list[MilestoneOut])
-async def pending_review(limit: int = 50, db: AsyncSession = Depends(get_db)):
+async def pending_review(limit: int = 500, db: AsyncSession = Depends(get_db)):
     """Return milestones awaiting user approval, highest confidence first."""
     entries = await get_pending_review(db, limit=limit)
     return [

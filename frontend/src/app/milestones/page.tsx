@@ -30,7 +30,7 @@ export default function MilestonesPage() {
     setFocusedIdx(0);
     try {
       const [items, kids] = await Promise.all([
-        tab === "pending" ? getPendingMilestones(50) : listMilestones(true),
+        tab === "pending" ? getPendingMilestones(500) : listMilestones(true),
         listChildren(),
       ]);
       setMilestones(items);

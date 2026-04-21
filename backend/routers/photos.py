@@ -1,10 +1,12 @@
 """
 Photo import and scanning endpoints.
-POST /photos/scan       — scan a local directory (background job)
-POST /photos/upload     — upload a single photo file (synchronous, returns detection)
-GET  /photos            — list all imported photos
-GET  /photos/{id}       — single photo detail
-GET  /photos/{id}/image — serve the original photo file
+POST /photos/scan            — scan a local directory (background job)
+POST /photos/upload          — upload a single photo file (synchronous, returns detection)
+GET  /photos                 — list imported photos (filterable by date, milestones, no-date)
+PATCH /photos/{id}           — update photo metadata (taken_at)
+DELETE /photos/{id}          — remove photo + its milestones from the DB
+GET  /photos/{id}            — single photo detail
+GET  /photos/{id}/image      — serve the original photo file
 """
 import asyncio
 import mimetypes
@@ -15,17 +17,18 @@ import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, BackgroundTasks, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, BackgroundTasks, UploadFile, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, computed_field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 from models import Photo, Milestone
 from services.photo_scanner import (
     list_photo_files,
-    filter_files_by_exif_date,
+    read_dates_bulk,
+    cluster_bursts,
     scan_files,
     scan_file,
     scan_photo,
@@ -108,6 +111,25 @@ class PhotoResponse(BaseModel):
         from_attributes = True
 
 
+class PhotoUpdate(BaseModel):
+    taken_at: Optional[datetime.datetime] = None
+
+
+def _passes_date_filter(
+    dt: Optional[datetime.datetime],
+    start_date: Optional[datetime.date],
+    end_date: Optional[datetime.date],
+) -> bool:
+    d = dt.date() if dt else None
+    if d is None:
+        return True  # fail-open
+    if start_date and d < start_date:
+        return False
+    if end_date and d > end_date:
+        return False
+    return True
+
+
 async def _run_scan(
     session_id: str,
     directory: str,
@@ -126,7 +148,7 @@ async def _run_scan(
         "status": "listing", "scanned": 0, "total": 0, "detected": 0,
         "date_filtered": 0, "prefilter_passed": 0, "prefilter_total": 0,
         "cloud_skipped": 0, "cached_skipped": 0,
-        "face_total": 0, "face_passed": 0,
+        "face_total": 0, "face_passed": 0, "burst_collapsed": 0,
     }
     _scan_jobs[session_id] = job
 
@@ -145,28 +167,41 @@ async def _run_scan(
         ]
         job["cached_skipped"] = before_cache - len(local_files)
 
-        # ── Phase 3: fast EXIF date filter (parallel, no thumbnail work) ─────
+        # ── Phase 3: bulk date read ───────────────────────────────────────────
+        # Windows: single Shell property-store call (fast, no file opens).
+        # Fallback: parallel EXIF reads + mtime. Dates are used for filtering,
+        # clustering, and populating Photo.taken_at — no second EXIF pass needed.
+        job["status"] = "reading_dates"
+        job["total"] = len(local_files)
+        dates = await read_dates_bulk(local_files)
+
+        # Sort by taken_at so date filter and burst clustering are accurate
+        local_files.sort(
+            key=lambda f: dates.get(str(f).lower()) or datetime.datetime(9999, 1, 1)
+        )
+
+        # ── Phase 4: date range filter ────────────────────────────────────────
         if start_date or end_date:
             job["status"] = "date_checking"
-            job["total"] = len(local_files)
-            job["scanned"] = 0
+            before_date = len(local_files)
+            local_files = [
+                f for f in local_files
+                if _passes_date_filter(dates.get(str(f).lower()), start_date, end_date)
+            ]
+            job["date_filtered"] = before_date - len(local_files)
 
-            def on_date_progress(current, total, filename):
-                job["scanned"] = current
-                job["total"] = total
-                job["current_file"] = filename
+        # ── Phase 5: burst deduplication (before thumbnail generation) ────────
+        # Groups photos taken within 60s of each other; keeps the largest file
+        # per cluster (free size proxy for quality, no file opens). This runs
+        # before scan_files so we never generate thumbnails for discarded siblings.
+        job["status"] = "clustering"
+        before_cluster = len(local_files)
+        local_files = cluster_bursts(local_files, dates)
+        job["burst_collapsed"] = before_cluster - len(local_files)
 
-            candidates = await filter_files_by_exif_date(
-                local_files, start_date, end_date,
-                progress_callback=on_date_progress,
-            )
-            job["date_filtered"] = len(local_files) - len(candidates)
-        else:
-            candidates = local_files
-
-        # ── Phase 4: read filtered photos (thumbnail only, parallel) ─────────
+        # ── Phase 6: scan files (thumbnails only, representatives only) ───────
         job["status"] = "scanning"
-        job["total"] = len(candidates)
+        job["total"] = len(local_files)
         job["scanned"] = 0
         job["current_file"] = ""
 
@@ -176,15 +211,15 @@ async def _run_scan(
             job["current_file"] = filename
 
         photos = await scan_files(
-            candidates,
+            local_files,
+            dates=dates,                # skip redundant EXIF re-parse
             progress_callback=on_scan_progress,
-            include_full=False,   # lazy — only for photos that reach detection
+            include_full=False,         # lazy — only for photos that reach detection
         )
-        # Drop any that errored (couldn't be read)
         photos = [p for p in photos if not p.error]
         photos = sort_by_timestamp(photos)
 
-        # ── Phase 5: local face detection (free) ─────────────────────────────
+        # ── Phase 7: local face detection (free) ─────────────────────────────
         if photos:
             job["status"] = "face_check"
             job["face_total"] = len(photos)
@@ -200,7 +235,7 @@ async def _run_scan(
 
             photos = await face_filter_batch(photos, progress_callback=on_face_progress)
 
-        # ── Phase 6: Haiku prefilter — "does this contain a child?" ──────────
+        # ── Phase 8: Haiku prefilter — "does this contain a child?" ──────────
         if use_prefilter and photos:
             job["status"] = "prefiltering"
             job["prefilter_total"] = len(photos)
@@ -218,7 +253,7 @@ async def _run_scan(
             )
             job["total"] = len(photos)
 
-        # ── Phase 7: detect milestones (parallel, lazy full_b64 hydration) ───
+        # ── Phase 9: detect milestones (parallel, lazy full_b64 hydration) ───
         job["status"] = "detecting"
         job["detected"] = 0
         job["total"] = len(photos)
@@ -236,7 +271,7 @@ async def _run_scan(
             hydrate=True,
         )
 
-        # ── Phase 6: persist ─────────────────────────────────────────────────
+        # ── Phase 10: persist ────────────────────────────────────────────────
         job["status"] = "saving"
         async with SessionLocal() as db:
             # Pre-load child birth date once (used for age computation below)
@@ -389,15 +424,55 @@ async def scan_stream(session_id: str):
 
 
 @router.get("", response_model=list[PhotoResponse])
-async def list_photos(db: AsyncSession = Depends(get_db)):
-    stmt = select(Photo).order_by(Photo.taken_at.asc().nulls_last())
-    photos = (await db.execute(stmt)).scalars().all()
+async def list_photos(
+    start_date: Optional[datetime.date] = Query(None),
+    end_date: Optional[datetime.date] = Query(None),
+    has_milestones: Optional[bool] = Query(None),
+    no_date: bool = Query(False),
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    List photos with optional filters. Uses a single query with milestone count
+    subquery — no N+1. Filters:
+      start_date / end_date  — taken_at range (inclusive)
+      has_milestones         — true=only photos with milestones, false=only without
+      no_date                — true=only photos with no taken_at
+      limit / offset         — pagination (default 500)
+    """
+    cnt_sq = (
+        select(Milestone.photo_id, func.count(Milestone.id).label("cnt"))
+        .group_by(Milestone.photo_id)
+        .subquery()
+    )
+    stmt = (
+        select(Photo, func.coalesce(cnt_sq.c.cnt, 0).label("milestone_count"))
+        .outerjoin(cnt_sq, Photo.id == cnt_sq.c.photo_id)
+    )
 
-    result = []
-    for photo in photos:
-        stmt2 = select(Milestone).where(Milestone.photo_id == photo.id)
-        milestones = (await db.execute(stmt2)).scalars().all()
-        result.append(PhotoResponse(
+    if no_date:
+        stmt = stmt.where(Photo.taken_at.is_(None))
+    else:
+        if start_date:
+            stmt = stmt.where(
+                Photo.taken_at >= datetime.datetime.combine(start_date, datetime.time.min)
+            )
+        if end_date:
+            stmt = stmt.where(
+                Photo.taken_at <= datetime.datetime.combine(end_date, datetime.time.max)
+            )
+
+    if has_milestones is True:
+        stmt = stmt.where(cnt_sq.c.cnt.isnot(None))
+    elif has_milestones is False:
+        stmt = stmt.where(cnt_sq.c.cnt.is_(None))
+
+    stmt = stmt.order_by(Photo.taken_at.asc().nulls_last()).limit(limit).offset(offset)
+
+    rows = (await db.execute(stmt)).all()
+    return [
+        PhotoResponse(
             id=photo.id,
             filename=photo.filename,
             file_path=photo.file_path,
@@ -406,9 +481,54 @@ async def list_photos(db: AsyncSession = Depends(get_db)):
             width=photo.width,
             height=photo.height,
             processed=photo.processed,
-            milestone_count=len(milestones),
-        ))
-    return result
+            milestone_count=count,
+        )
+        for photo, count in rows
+    ]
+
+
+@router.patch("/{photo_id}", response_model=PhotoResponse)
+async def update_photo(
+    photo_id: int,
+    update: PhotoUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update photo metadata. Currently supports setting taken_at."""
+    photo = await db.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if "taken_at" in update.model_fields_set:
+        photo.taken_at = update.taken_at
+    await db.commit()
+    await db.refresh(photo)
+    stmt = select(func.count(Milestone.id)).where(Milestone.photo_id == photo_id)
+    count = (await db.execute(stmt)).scalar_one() or 0
+    return PhotoResponse(
+        id=photo.id,
+        filename=photo.filename,
+        file_path=photo.file_path,
+        thumbnail_path=photo.thumbnail_path,
+        taken_at=photo.taken_at,
+        width=photo.width,
+        height=photo.height,
+        processed=photo.processed,
+        milestone_count=count,
+    )
+
+
+@router.delete("/{photo_id}", status_code=204)
+async def delete_photo(photo_id: int, db: AsyncSession = Depends(get_db)):
+    """Remove a photo and all its milestones from the DB. Does not delete the file on disk."""
+    photo = await db.get(Photo, photo_id)
+    if not photo:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    milestones = (await db.execute(
+        select(Milestone).where(Milestone.photo_id == photo_id)
+    )).scalars().all()
+    for m in milestones:
+        await db.delete(m)
+    await db.delete(photo)
+    await db.commit()
 
 
 @router.post("/upload")
